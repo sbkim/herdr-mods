@@ -1,9 +1,8 @@
 // herdr rename-history: keeps the current bookmark list of each Herdr
 // terminal in one state file per terminal, under
 // ~/.config/herdr-app/data/rename-history/<address>.json, for the Herdr
-// rename-history mod and the herdr-core-mcp history tools. The mod reads the
-// file when its menu opens; the MCP tools read it for voice queries. Neither
-// polls anything.
+// rename-history mod. The mod reads the file when its menu opens; other tools
+// can read the same state files for their own queries. Neither polls anything.
 //
 // Why per-terminal files rather than one append log: a terminal has exactly
 // one owning omo process, so each file has a single writer — no lock file is
@@ -25,9 +24,15 @@
 //   under 4 characters are not distinctive enough to anchor and are dropped.
 //   The full prompt (1,000 chars) and report (4,000 chars) are kept alongside,
 //   so a report stays readable after the scrollback is gone.
-// - Bookmarks are numbered oldest-first from 1; nextNum is persisted so an
-//   eviction under the 50-item cap never renumbers what remains, and /new
-//   (the file is deleted) starts over at 1.
+// - Bookmarks are numbered oldest-first from 1; an eviction under the
+//   50-item cap never renumbers what remains.
+// - The store is session-scoped: the file carries the writing session's id.
+//   An --session resume of the same session keeps its history; any other
+//   session started in that terminal (a fresh omo, /new included) archives
+//   the file whole under data/rename-history/archive/<address>/ and starts
+//   over at 1. Archives keep the newest 10 sessions per terminal for 30 days
+//   within a 20 MB total cap. /exit writes nothing, so an exited session can
+//   be resumed with its history intact.
 // - On load, state files whose terminal no longer exists (not in hc ls) are
 //   removed.
 //
@@ -35,7 +40,7 @@
 // silent, and nothing is written to the screen.
 
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_ITEMS = 50;
@@ -43,9 +48,13 @@ const ANCHOR_PREFIX = 60;
 const ANCHOR_LINES = 3;
 const ANCHOR_MIN_LEN = 4;
 const PROMPT_MAX = 1_000;
+const ARCHIVE_KEEP = 10;
+const ARCHIVE_DAYS = 30;
+const ARCHIVE_TOTAL = 20 * 1024 * 1024;
 const REPORT_MAX = 4_000;
 
 const stateDir = join(process.env.HOME ?? "", ".config/herdr-app/data/rename-history");
+const ARCHIVE_DIR = join(stateDir, "archive");
 
 interface Bookmark {
   num: number;
@@ -72,6 +81,18 @@ export default function (pi: ExtensionAPI) {
   // closure never leaks across sessions of a shared daemon.
   let address: string | null = null;
   let addressResolved = false;
+  let sessionAdopted = false;
+
+  // This session's id when the host exposes it; "" when it does not (then
+  // the store keeps whatever it holds — never a wrong reset).
+  function mySession(): string {
+    try {
+      const id = (pi as { sessionManager?: { getSessionId?: () => unknown } }).sessionManager?.getSessionId?.();
+      return typeof id === "string" && id.length > 0 ? id : "";
+    } catch {
+      return "";
+    }
+  }
 
   function fileOf(addr: string): string {
     // Remote addresses contain "/" (vps/t7); percent-encoding keeps one file
@@ -102,8 +123,8 @@ export default function (pi: ExtensionAPI) {
   // Single-writer atomic replace; a failure must never surface in the session.
   // Items are renumbered densely oldest-first on every write: transient title
   // events (auto retitles, turn forks) come and go, and dense numbering keeps
-  // the voice-facing numbers usable — list_history always shows the current
-  // ones. /new deletes the file, which starts over at 1.
+  // small numbers meaningful for anything reading the store. /new and any
+  // new session archive the file, which starts over at 1.
   function writeState(addr: string, items: Bookmark[]) {
     try {
       const kept = items.slice(-MAX_ITEMS);
@@ -111,7 +132,7 @@ export default function (pi: ExtensionAPI) {
       mkdirSync(stateDir, { recursive: true, mode: 0o700 });
       const file = fileOf(addr);
       const tmp = `${file}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 2, address: addr, items: kept }) + "\n", { mode: 0o600 });
+      writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600 });
       renameSync(tmp, file);
     } catch {}
   }
@@ -121,6 +142,94 @@ export default function (pi: ExtensionAPI) {
       const st = readState(addr);
       if (!fn(st.items)) return;
       writeState(addr, st.items);
+    });
+  }
+
+  // Move the terminal's current file into its archive slot, whole. The file
+  // is gone afterwards, so the next write starts this session fresh at 1.
+  function archiveState(addr: string): void {
+    try {
+      const file = fileOf(addr);
+      if (!existsSync(file)) return;
+      let session = "";
+      try {
+        session = String((JSON.parse(readFileSync(file, "utf8")) as { session?: string }).session ?? "");
+      } catch {}
+      const name = session || "legacy-v2-" + Date.now();
+      const dir = join(ARCHIVE_DIR, encodeURIComponent(addr));
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      renameSync(file, join(dir, name + ".json"));
+    } catch {}
+    trimArchives();
+  }
+
+  // Per terminal keep the newest ARCHIVE_KEEP sessions no older than
+  // ARCHIVE_DAYS; across all terminals stay under ARCHIVE_TOTAL bytes.
+  function trimArchives(): void {
+    try {
+      const cutoff = Date.now() - ARCHIVE_DAYS * 86_400_000;
+      const live: { p: string; m: number; s: number }[] = [];
+      for (const d of readdirSync(ARCHIVE_DIR)) {
+        const sub = join(ARCHIVE_DIR, d);
+        let names: string[];
+        try {
+          names = readdirSync(sub);
+        } catch {
+          continue;
+        }
+        const files = names
+          .map((n) => {
+            const q = join(sub, n);
+            try {
+              return { p: q, m: statSync(q).mtimeMs, s: statSync(q).size };
+            } catch {
+              return null;
+            }
+          })
+          .filter((x): x is { p: string; m: number; s: number } => x !== null)
+          .sort((a, b) => b.m - a.m);
+        files.slice(ARCHIVE_KEEP).forEach((f) => {
+          try {
+            unlinkSync(f.p);
+          } catch {}
+        });
+        for (const f of files.slice(0, ARCHIVE_KEEP)) {
+          if (f.m < cutoff) {
+            try {
+              unlinkSync(f.p);
+            } catch {}
+            continue;
+          }
+          live.push(f);
+        }
+      }
+      let total = live.reduce((a, f) => a + f.s, 0);
+      if (total > ARCHIVE_TOTAL) {
+        live.sort((a, b) => a.m - b.m);
+        for (const f of live) {
+          if (total <= ARCHIVE_TOTAL) break;
+          try {
+            unlinkSync(f.p);
+            total -= f.s;
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // Once per process, before this session's first state change: make the
+  // store this session's. A file written by another session of this terminal
+  // is archived whole; a file this very session wrote (--session resume)
+  // stays as it is.
+  async function adopt(addr: string): Promise<void> {
+    if (sessionAdopted) return;
+    sessionAdopted = true;
+    await serialized(() => {
+      try {
+        const raw = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { session?: string };
+        const mine = mySession();
+        if (mine && raw.session !== mine) archiveState(addr);
+      } catch {}
     });
   }
 
@@ -240,6 +349,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const addr = await resolveAddress();
       if (!addr) return;
+      await adopt(addr);
       const title = (event.name ?? "").slice(0, 80);
       if (!title) return;
       if (!(await wasTypedRename(addr, event.name ?? ""))) return;
@@ -263,6 +373,7 @@ export default function (pi: ExtensionAPI) {
       const prompt = unwrapEnvelope(text).trim().slice(0, PROMPT_MAX);
       const addr = await resolveAddress();
       if (!addr) return;
+      await adopt(addr);
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (!items[i].promptAnchor) {
@@ -295,6 +406,7 @@ export default function (pi: ExtensionAPI) {
       const report = text.length > REPORT_MAX ? text.slice(-REPORT_MAX) : text;
       const addr = await resolveAddress();
       if (!addr) return;
+      await adopt(addr);
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (items[i].promptAnchor) {
@@ -313,9 +425,8 @@ export default function (pi: ExtensionAPI) {
       if (event.reason !== "new") return;
       const addr = await resolveAddress();
       if (!addr) return;
-      try {
-        unlinkSync(fileOf(addr));
-      } catch {}
+      sessionAdopted = true;
+      archiveState(addr);
     } catch {}
   });
 

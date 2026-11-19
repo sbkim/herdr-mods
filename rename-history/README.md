@@ -23,6 +23,10 @@ with the omo agent's terminals (see Limits).
 - Only a `/rename` the person actually typed is recorded (the extension
   checks the terminal's tail for the "Session name set" line; titles omo or
   an agent set on their own are filtered out).
+- **Session-scoped**: the file carries the writing session's id. Resuming the
+  same session (`omo --session …` after `/exit`) keeps its history; any other
+  session started in that terminal (a fresh omo, `/new`) archives the file
+  whole and starts over at 1. `/exit` itself keeps everything.
 - The full prompt (up to 1,000 characters) and the final report (the last
   assistant text of the run, up to 4,000 characters keeping the conclusion
   side) are stored beside the anchors, so a report stays readable even after
@@ -76,18 +80,27 @@ title to jump; Esc closes. Everything else in the menu works as before.
 ## State files
 
 One JSON file per terminal under
-`~/.config/herdr-app/data/rename-history/<address>.json`:
+`~/.config/herdr-app/data/rename-history/<address>.json` — the **current
+session's** history:
 
 ```json
-{ "v": 2, "address": "…", "items": [
+{ "v": 3, "address": "…", "session": "…", "items": [
   { "num": 1, "title": "…", "ts": 0,
     "promptAnchor": ["…"], "reportAnchor": ["…"],
     "prompt": "up to 1,000 chars", "report": "up to 4,000 chars, tail kept" } ] }
 ```
 
-Numbers are reassigned densely 1..N (oldest first) on every write. The store
-holds report text, so it is created with the folder at mode 700 and the files
-at 600.
+Numbers are reassigned densely 1..N (oldest first) on every write. A
+different session starting in the terminal moves the file whole into
+`data/rename-history/archive/<address>/<session>.json` (a version-2 file
+with no session id archives as `legacy-v2-<time>.json`). Archives keep the
+**newest 10 sessions per terminal for 30 days**, within a **20 MB** total
+cap. The store holds report text, so it is created with the folder at mode
+700 and the files at 600.
+
+Tools built on the state files (voice assistants, agents) read the terminal
+file for the current session and can list `archive/<address>/` and read a
+file by session id for past sessions.
 
 ## Limits
 

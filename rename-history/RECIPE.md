@@ -51,8 +51,15 @@ chars), ts}; on user `message_end` attach up to 3 prompt anchor lines
 attach report anchors and the final report — the last assistant text of the
 run, 4,000 chars keeping the tail (conclusion side) — skipping rename
 confirmation one-liners; on `session_start` reason "new" delete the file
-(numbers start over at 1). One JSON file per terminal, {v: 2, address,
-items: [{num, title, ts, promptAnchor, reportAnchor, prompt, report}]},
+(numbers start over at 1 — and any other session starting in that
+terminal does the same, because the store is session-scoped: the file
+records the writing session's id via `pi.sessionManager.getSessionId()`;
+an `--session` resume of the same session keeps its history, a different
+session archives the file whole under `archive/<address>/<session>.json`
+(newest 10 per terminal, 30 days, 20 MB total; a v2 file with no session id
+archives as legacy-v2-&lt;time&gt;), and `/exit` keeps everything). One JSON
+file per terminal, {v: 3, address, session, items: [{num, title, ts,
+promptAnchor, reportAnchor, prompt, report}]},
 numbers reassigned densely 1..N oldest-first on every write (a 50-item
 eviction never renumbers the rest), single writer through a serialized queue,
 temp file + atomic rename with the folder at 700 and files at 600; forked and
@@ -83,7 +90,9 @@ and silent. Assumes Herdr 0.1.x with terminal_menu layouts support and omo
 `"terminal_menu": "rename-history"` in a personal layout and Herdr
 restarted, a right-click shows the usual items plus RENAME HISTORY once the
 extension has recorded a title, each row labelled "N. title"; a title omo or
-the agent set on its own never appears; picking an old title scrolls the
+the agent set on its own never appears; resuming with `--session` keeps the
+history while a fresh omo or `/new` in that terminal archives the file and
+restarts at 1; picking an old title scrolls the
 terminal to its report (or shows the tail dialog when the position is gone);
 "+N older" appears beyond 12 bookmarks, 50 are kept and dense numbering
 survives eviction; the state file holds prompt and report text at 600; a plain right-click on a shell
