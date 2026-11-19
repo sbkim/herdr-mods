@@ -1,8 +1,9 @@
 // herdr rename-history: keeps the current bookmark list of each Herdr
 // terminal in one state file per terminal, under
 // ~/.config/herdr-app/data/rename-history/<address>.json, for the Herdr
-// rename-history mod. The mod reads the file when its menu opens; other tools
-// can read the same state files for their own queries. Neither polls anything.
+// rename-history mod and the herdr-core-mcp history tools. The mod reads the
+// file when its menu opens; the MCP tools read it for voice queries. Neither
+// polls anything.
 //
 // Why per-terminal files rather than one append log: a terminal has exactly
 // one owning omo process, so each file has a single writer — no lock file is
@@ -60,7 +61,12 @@ export default function (pi: ExtensionAPI) {
   // Sessions of a shared daemon share the process, so forked and worker
   // sessions resolve to the same terminal and would race this file with
   // their own queues. Only the pristine interactive session records history.
-  if (pi.sessionKind === "worker" || Object.keys(pi.sessionContext ?? {}).length > 0) return;
+  // omo's own task-RPC classifier marks those with sessionContext.role of
+  // child, dag_child or member; a control endpoint (gateway) session is an
+  // ordinary interactive session whose context only names its host
+  // (host_instance/host_socket), so it records like any other.
+  const role = (pi.sessionContext ?? {}).role;
+  if (pi.sessionKind === "worker" || role === "child" || role === "dag_child" || role === "member") return;
 
   // Per-session state: the extension factory runs once per session, so this
   // closure never leaks across sessions of a shared daemon.
@@ -96,8 +102,8 @@ export default function (pi: ExtensionAPI) {
   // Single-writer atomic replace; a failure must never surface in the session.
   // Items are renumbered densely oldest-first on every write: transient title
   // events (auto retitles, turn forks) come and go, and dense numbering keeps
-  // small numbers meaningful for anything reading the store. /new deletes
-  // the file, which starts over at 1.
+  // the voice-facing numbers usable — list_history always shows the current
+  // ones. /new deletes the file, which starts over at 1.
   function writeState(addr: string, items: Bookmark[]) {
     try {
       const kept = items.slice(-MAX_ITEMS);
