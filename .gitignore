@@ -1,0 +1,5 @@
+.DS_Store
+# runtime state the mod writes into its own folder
+terminal-numbers/numbers.json
+# personal number seeds (copy from seed.example.json if you want one)
+terminal-numbers/seed.json

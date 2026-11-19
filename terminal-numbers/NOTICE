@@ -1,0 +1,8 @@
+terminal-numbers
+
+This mod's pane header is a derivative of the shipped `pane` header mod, and
+close.svg, split-right.svg, split-down.svg, zoom.svg, unzoom.svg and
+spinner.svg are copied unchanged, from the Herdr app
+(https://github.com/herdrdev/herdr-app), which is Copyright the Herdr authors
+and licensed under the Apache License, Version 2.0 (LICENSE-APACHE in this
+folder). The rest of this folder is MIT (the repository LICENSE).
