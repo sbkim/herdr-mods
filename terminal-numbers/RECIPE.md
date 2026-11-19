@@ -22,23 +22,23 @@ split-right / split-down / zoom / close icon buttons. The manager popup
 (400px wide) lists every numbered terminal as a 30px row: a bordered 26x24
 `-` button, the number tile, a bordered `+` button, the terminal's title, and
 its folder dimmed on the right; above the list a 14px semibold title
-("터미널 번호"), two 12px guide lines, a bordered "다시 매기기 (화면 순서)"
-button and a "닫기" button at the top right; a dim footer names
+("Terminal numbers"), two 12px guide lines, a bordered "Renumber by position"
+button and a "Close" button at the top right; a dim footer names
 `numbers.json` and the label.
 
 **How it behaves:** numbers never change on their own when panes move, split,
 zoom or get dragged — the map is sticky, keyed by terminal address. A new
 pane terminal takes the smallest free number; when a terminal closes its
 number frees; a parked terminal keeps its number while it lives. Clicking a
-number tile (pointer cursor, slight fade on hover; a tooltip "터미널 번호 —
-눌러서 번호 관리 열기") opens the manager as a popup at the pointer, the
+number tile (pointer cursor, slight fade on hover; a tooltip "Terminal
+number — click to manage numbers") opens the manager as a popup at the pointer, the
 clicked terminal's row highlighted; clicking the header elsewhere focuses the
 pane, as before. In the manager, `-` / `+` step that row's number by one and
 **swap** with whoever owned the target number (each button explains itself in
 a tooltip, and each row's tile shows the terminal's address in its tooltip);
-"다시 매기기" reassigns 1..N in `panes()` order — the layout tree's reading
+"Renumber by position" reassigns 1..N in `panes()` order — the layout tree's reading
 order, columns left to right, each top to bottom — dropping numbers of
-paneless (parked) terminals; "닫기" and Esc close. Agent status marks work
+paneless (parked) terminals; "Close" and Esc close. Agent status marks work
 exactly as the shipped header: working spins, blocked shows the pill, done
 shows the dot; nothing of it moves the number. On first run with no numbers,
 `seed.json` in the mod folder is adopted if present, else any `herdr.num`

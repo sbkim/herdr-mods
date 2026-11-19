@@ -230,7 +230,7 @@ export default class TerminalNumbers extends View {
       .rounded(6).bg(t.solid).text_color(t.solid_foreground)
       .text_size(15).font_bold()
       .when(clickable, (el) => el.cursor_pointer().hover((s) => s.opacity(0.85))
-        .tooltip("터미널 번호 — 눌러서 번호 관리 열기")
+        .tooltip("Terminal number — click to manage numbers")
         .on_click((_e, cx) => {
           cx.stop_propagation();
           openOverlay({ mod: "terminal-numbers", kind: "popup", width: 400, height: 620, props: { pick: terminal } });
@@ -303,9 +303,9 @@ export default class TerminalNumbers extends View {
         .id(`tn-row-${addr}`)
         .h(30).gap(8).items_center().px(8).rounded(8)
         .when(p.pick === addr, (el) => el.bg(t.selected))
-        .child(step(`tn-minus-${addr}`, -1, "-", "번호 하나 낮춤 · 이미 쓰는 번호면 그 터미널과 맞바꿈"))
-        .child(this.badge(t, m[addr], `tn-m-${addr}`, false, addr).tooltip(`터미널 주소 ${addr}`))
-        .child(step(`tn-plus-${addr}`, 1, "+", "번호 하나 높임 · 이미 쓰는 번호면 그 터미널과 맞바꿈"))
+        .child(step(`tn-minus-${addr}`, -1, "-", "Lower the number by one; a taken number swaps"))
+        .child(this.badge(t, m[addr], `tn-m-${addr}`, false, addr).tooltip(`Terminal address ${addr}`))
+        .child(step(`tn-plus-${addr}`, 1, "+", "Raise the number by one; a taken number swaps"))
         .child(div().flex_1().truncate().text_size(12).text_color(t.foreground).child(pane?.title || addr))
         .child(div().flex_none().truncate().max_w(110).text_size(11).text_color(t.dim).child(folder(pane?.cwd)));
     });
@@ -315,16 +315,16 @@ export default class TerminalNumbers extends View {
       .hover((s) => s.opacity(0.88)).when(Boolean(tip), (el) => el.tooltip(tip)).on_click(action).child(text);
     return v_flex().id("tn-manager").w(400).p(14).gap(8).bg(t.popover).text_color(t.foreground)
       .child(h_flex().items_center().gap(8)
-        .child(div().flex_1().text_size(14).font_semibold().child("터미널 번호"))
-        .when(p.overlay != null, (el) => el.child(button("tn-close", "닫기", false, () => closeOverlay(p.overlay), "팝업을 닫습니다 (Esc)"))))
+        .child(div().flex_1().text_size(14).font_semibold().child("Terminal numbers"))
+        .when(p.overlay != null, (el) => el.child(button("tn-close", "Close", false, () => closeOverlay(p.overlay), "Close the popup (Esc)"))))
       .child(div().text_size(12).text_color(t.muted)
-        .child("- / + 버튼으로 번호 변경 · 겹치는 번호면 서로 교체"))
+        .child("Use - / + to change a number; duplicates swap"))
       .child(div().text_size(12).text_color(t.muted)
-        .child("새 터미널은 비어 있는 가장 작은 번호를 받습니다"))
-      .child(button("tn-renumber", "다시 매기기 (화면 순서)", false, () => renumber(),
-        "왼쪽 열부터, 열 안은 위에서 아래 순서로 1번부터 다시 매깁니다. 직접 정한 번호는 사라집니다."))
+        .child("New terminals take the smallest free number"))
+      .child(button("tn-renumber", "Renumber by position", false, () => renumber(),
+        "Renumbers 1..N in screen order: columns left to right, each top to bottom. Numbers set by hand are lost."))
       .child(v_flex().id("tn-rows").flex_none().h(Math.min(rows.length, 12) * 32 + 6).overflow_y_scrollbar().gap(2).children(rows))
       .child(div().text_size(10.5).text_color(t.muted)
-        .child("번호→주소 대응: mods/terminal-numbers/numbers.json · hc get <주소> 라벨 herdr.num"));
+        .child("numbers.json in this mod's folder maps numbers to addresses; hc get <address> shows the herdr.num label"));
   }
 }

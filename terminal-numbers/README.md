@@ -20,8 +20,8 @@ with file access can answer "which one is 5?".
   number (a parked one keeps it while it lives).
 - **A manager popup**: click any number tile. Each row has `-` / `+` (a taken
   number swaps with its owner) and a tooltip with the terminal's address.
-  "다시 매기기 (화면 순서)" renumbers 1..N in the layout's reading order
-  (columns left to right, each top to bottom). The popup's copy is Korean.
+  "Renumber by position" renumbers 1..N in the layout's reading order
+  (columns left to right, each top to bottom).
 - **First-run seed**: with no numbers yet, the mod adopts `seed.json` in its
   own folder if present (see `seed.example.json`; `{}` starts from layout
   order), else any `herdr.num` labels, else the layout order.
