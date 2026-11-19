@@ -256,7 +256,7 @@ export default class Menu extends View {
                 .hover((s) => s.bg(t.hover))
                 .on_click((_e, cx) => this.choose(i, cx))
                 .child(svg("mods/rename-history/bookmark.svg").size(13).flex_none().text_color(t.muted))
-                .child(div().flex_1().min_w(0).truncate().child(it.rh.title))
+                .child(div().flex_1().min_w(0).truncate().child(`${it.rh.num}. ${it.rh.title}`))
                 .child(
                   div()
                     .flex_none()

@@ -12,12 +12,22 @@ with the omo agent's terminals (see Limits).
 
 - The usual right-click menu (Rename, Split, Zoom, Close, worktrees, themes —
   everything the shipped `menu` has), plus a RENAME HISTORY section when the
-  terminal has history: each row shows a bookmark icon, the title and the
-  time, with `report` or `prompt` saying where a jump lands. More than 12
-  bookmarks are summarized as "+N older"; 50 are kept per terminal.
+  terminal has history: each row shows a bookmark icon, "<number>. <title>"
+  and the time, with `report` or `prompt` saying where a jump lands. Titles
+  are numbered densely 1..N oldest-first (a full history survives under the
+  50-item cap). More than 12 bookmarks are summarized as "+N older"; 50 are
+  kept per terminal, and `/new` starts the numbers over at 1.
 - Jumping locates the title by text anchors in the scrollback (one `hc read`
   at jump time), so it survives reflow. When the position is gone, a dialog
   shows the terminal's tail instead.
+- Only a `/rename` the person actually typed is recorded (the extension
+  checks the terminal's tail for the "Session name set" line; titles omo or
+  an agent set on their own are filtered out).
+- The full prompt (up to 1,000 characters) and the final report (the last
+  assistant text of the run, up to 4,000 characters keeping the conclusion
+  side) are stored beside the anchors, so a report stays readable even after
+  the scrollback is gone. Separate tools can read the same state files for
+  voice or agent queries.
 - Works on Shift+right-click too (when a program takes the mouse and plain
   right-click goes to it).
 
@@ -63,10 +73,32 @@ Right-click a terminal (Shift+right-click when the program takes the mouse):
 the RENAME HISTORY section sits above the usual items. Click or ↑/↓ + Enter a
 title to jump; Esc closes. Everything else in the menu works as before.
 
+## State files
+
+One JSON file per terminal under
+`~/.config/herdr-app/data/rename-history/<address>.json`:
+
+```json
+{ "v": 2, "address": "…", "items": [
+  { "num": 1, "title": "…", "ts": 0,
+    "promptAnchor": ["…"], "reportAnchor": ["…"],
+    "prompt": "up to 1,000 chars", "report": "up to 4,000 chars, tail kept" } ] }
+```
+
+Numbers are reassigned densely 1..N (oldest first) on every write. The store
+holds report text, so it is created with the folder at mode 700 and the files
+at 600.
+
 ## Limits
 
 - The history is recorded by an **omo extension** — terminals running other
-  agents or plain shells get the plain menu without the section.
+  agents or plain shells get the plain menu without the section. Forked or
+  worker omo sessions share a terminal and do not record.
+- Only **typed** `/rename`s are recorded; detecting one costs a short
+  `hc read` of the terminal's tail per title event.
+- The final report is the **last assistant text of the latest run** —
+  intermediate tool-call turns are not kept, and very short rename
+  confirmations are skipped.
 - A rename whose turn was too short to capture lands on the **prompt** line
   rather than a report.
 - The menu shows the **12** most recent titles; **50** are kept per terminal.
@@ -74,8 +106,10 @@ title to jump; Esc closes. Everything else in the menu works as before.
 
 ## Privacy & reach
 
-The extension writes one small JSON file per omo terminal under Herdr's
-`data/` folder and runs `hc ls` / `hc get` to find which terminal it is in.
+The extension writes one JSON file per omo terminal under Herdr's `data/`
+folder (folder 700, files 600 — reports can carry secrets) and runs `hc ls` /
+`hc get` to find which terminal it is in, plus one short `hc read` per title
+event.
 The mod reads those files (`readTextFile`), runs `git` for the menu's
 worktree items (as the shipped menu does) and one `hc read` on jump. Nothing
 leaves the machine.

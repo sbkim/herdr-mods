@@ -13,8 +13,9 @@ background, 12.8px text, 31px rows, 7px rounding, an icon at 14px in muted, a
 label, the key hint at 11px dim on the right, separators before Close /
 Keybinds and around theme groups) — with, above the pane items, a 10.5px dim
 "RENAME HISTORY" header (+"· +N older" when more exist) and one 31px row per
-bookmark: a 13px bookmark icon (the mod's own `bookmark.svg`), the title
-truncated in the middle, and on the right a 11px "HH:MM · report" (done color)
+bookmark: a 13px bookmark icon (the mod's own `bookmark.svg`), "N. title"
+(the store's dense number) truncated in the middle, and on the right a 11px
+"HH:MM · report" (done color)
 or "HH:MM · prompt" (dim). Arrow keys move the highlight, Enter runs, Esc
 closes. When a jump's position is gone, a 640x420 dialog shows the title, a
 note, and the terminal's last 40 lines in a scrolling list.
@@ -43,13 +44,21 @@ address>.json` ({v, address, items}), `watch(cx, addr)` re-reads on folder
 changes, `jump()` does the anchor search and `terminal.scroll`;
 `mod.json` { "place": "none", "overlay": { "width": 300, "height": 0.8 } }.
 (b) the omo extension `omo-extension/index.ts`: on
-`session_info_changed` push {title (max 80 chars), ts}; on user
-`message_end` attach up to 3 prompt anchor lines (prefix 60 chars, lines
-under 4 chars dropped); on `turn_end` attach report anchors the same way
-from the tail; on `session_start` reason "new" delete the file; one JSON
-file per terminal (single writer, temp file + atomic rename, bounded to 50
-items), address resolved once by matching `hc get` foreground pid against
-the process pid, dead terminals' files swept on load. herdr functions:
+`session_info_changed` — only for a rename the person typed, checked by one
+`hc read` of the tail for the "Session name set" line — push {title (max 80
+chars), ts}; on user `message_end` attach up to 3 prompt anchor lines
+(prefix 60 chars) plus the full prompt text (1,000 chars); on `agent_end`
+attach report anchors and the final report — the last assistant text of the
+run, 4,000 chars keeping the tail (conclusion side) — skipping rename
+confirmation one-liners; on `session_start` reason "new" delete the file
+(numbers start over at 1). One JSON file per terminal, {v: 2, address,
+items: [{num, title, ts, promptAnchor, reportAnchor, prompt, report}]},
+numbers reassigned densely 1..N oldest-first on every write (a 50-item
+eviction never renumbers the rest), single writer through a serialized queue,
+temp file + atomic rename with the folder at 700 and files at 600; forked and
+worker sessions return at once (they share a terminal); address resolved once
+by matching `hc get` foreground pid against the process pid; dead
+terminals' files swept (and chmod'd 600) on load. herdr functions:
 `props`, `run` (pane.focus, terminal.scroll, the menu's own commands),
 `openOverlay`/`closeOverlay`, `theme`, `keys`, `terminals`, `spaces`,
 `panes`, `exec` (git), `hc` (read), `readTextFile`, `watchFolder`,
@@ -63,8 +72,8 @@ an older copy); `mod.json`'s overlay height 0.8 (a share of the window)
 keeps the 12-row history plus the base items on screen; the popup is
 content-sized, so cap the shown rows (MAX_SHOWN 12) or the base items fall
 off; anchors are line prefixes, not row numbers, because the scrollback
-reflows; /rename is seen through `session_info_changed`, which carries no
-cause, so titles set by the agent itself are recorded too (known limit);
+reflows; a title event costs one `hc read` (8 lines) to prove it was typed,
+so agent-set titles are dropped; the report is the last assistant text only;
 remote addresses contain "/" and are percent-encoded into file names; the
 extension must never write to the session screen — every handler is guarded
 and silent. Assumes Herdr 0.1.x with terminal_menu layouts support and omo
@@ -73,7 +82,9 @@ and silent. Assumes Herdr 0.1.x with terminal_menu layouts support and omo
 **Done when:** `herdr-app check` on the mod folder passes; with
 `"terminal_menu": "rename-history"` in a personal layout and Herdr
 restarted, a right-click shows the usual items plus RENAME HISTORY once the
-extension has recorded a title; picking an old title scrolls the terminal to
-its report (or shows the tail dialog when the position is gone); "+N older"
-appears beyond 12 bookmarks and 50 are kept; a plain right-click on a shell
+extension has recorded a title, each row labelled "N. title"; a title omo or
+the agent set on its own never appears; picking an old title scrolls the
+terminal to its report (or shows the tail dialog when the position is gone);
+"+N older" appears beyond 12 bookmarks, 50 are kept and dense numbering
+survives eviction; the state file holds prompt and report text at 600; a plain right-click on a shell
 terminal shows the menu without the section; Esc closes.

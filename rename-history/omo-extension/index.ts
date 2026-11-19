@@ -1,8 +1,8 @@
 // herdr rename-history: keeps the current bookmark list of each Herdr
 // terminal in one state file per terminal, under
 // ~/.config/herdr-app/data/rename-history/<address>.json, for the Herdr
-// rename-history mod. The mod reads the file when its menu opens and never
-// polls anything.
+// rename-history mod. The mod reads the file when its menu opens; other tools
+// can read the same state files for their own queries. Neither polls anything.
 //
 // Why per-terminal files rather than one append log: a terminal has exactly
 // one owning omo process, so each file has a single writer — no lock file is
@@ -22,6 +22,11 @@
 //   anchors — the mod locates them with one `hc read` at jump time, because
 //   neither the extension nor hc can read the view's scroll position. Lines
 //   under 4 characters are not distinctive enough to anchor and are dropped.
+//   The full prompt (1,000 chars) and report (4,000 chars) are kept alongside,
+//   so a report stays readable after the scrollback is gone.
+// - Bookmarks are numbered oldest-first from 1; nextNum is persisted so an
+//   eviction under the 50-item cap never renumbers what remains, and /new
+//   (the file is deleted) starts over at 1.
 // - On load, state files whose terminal no longer exists (not in hc ls) are
 //   removed.
 //
@@ -29,24 +34,34 @@
 // silent, and nothing is written to the screen.
 
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
-import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_ITEMS = 50;
 const ANCHOR_PREFIX = 60;
 const ANCHOR_LINES = 3;
 const ANCHOR_MIN_LEN = 4;
+const PROMPT_MAX = 1_000;
+const REPORT_MAX = 4_000;
 
 const stateDir = join(process.env.HOME ?? "", ".config/herdr-app/data/rename-history");
 
 interface Bookmark {
+  num: number;
   title: string;
   ts: number;
   promptAnchor?: string[];
   reportAnchor?: string[];
+  prompt?: string;
+  report?: string;
 }
 
 export default function (pi: ExtensionAPI) {
+  // Sessions of a shared daemon share the process, so forked and worker
+  // sessions resolve to the same terminal and would race this file with
+  // their own queues. Only the pristine interactive session records history.
+  if (pi.sessionKind === "worker" || Object.keys(pi.sessionContext ?? {}).length > 0) return;
+
   // Per-session state: the extension factory runs once per session, so this
   // closure never leaks across sessions of a shared daemon.
   let address: string | null = null;
@@ -58,30 +73,49 @@ export default function (pi: ExtensionAPI) {
     return join(stateDir, encodeURIComponent(addr) + ".json");
   }
 
-  function readState(addr: string): Bookmark[] {
+  // Handlers run concurrently (each awaits address resolution first); their
+  // read-modify-write steps must not interleave or later events overwrite
+  // earlier ones. Every state change runs through this queue.
+  let queue: Promise<void> = Promise.resolve();
+  function serialized(fn: () => void) {
+    queue = queue.then(fn).catch(() => {});
+    return queue;
+  }
+
+  // Reports can carry secrets; only this user may read the store.
+  function readState(addr: string): { items: Bookmark[] } {
     try {
       const j = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { items?: Bookmark[] };
-      return Array.isArray(j.items) ? j.items : [];
+      const items = Array.isArray(j.items) ? j.items : [];
+      return { items };
     } catch {
-      return [];
+      return { items: [] };
     }
   }
 
   // Single-writer atomic replace; a failure must never surface in the session.
+  // Items are renumbered densely oldest-first on every write: transient title
+  // events (auto retitles, turn forks) come and go, and dense numbering keeps
+  // small numbers meaningful for anything reading the store. /new deletes
+  // the file, which starts over at 1.
   function writeState(addr: string, items: Bookmark[]) {
     try {
-      mkdirSync(stateDir, { recursive: true });
+      const kept = items.slice(-MAX_ITEMS);
+      kept.forEach((it, i) => (it.num = i + 1));
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
       const file = fileOf(addr);
       const tmp = `${file}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 1, address: addr, items }) + "\n");
+      writeFileSync(tmp, JSON.stringify({ v: 2, address: addr, items: kept }) + "\n", { mode: 0o600 });
       renameSync(tmp, file);
     } catch {}
   }
 
   function mutate(addr: string, fn: (items: Bookmark[]) => boolean) {
-    const items = readState(addr);
-    if (!fn(items)) return;
-    writeState(addr, items.slice(-MAX_ITEMS));
+    return serialized(() => {
+      const st = readState(addr);
+      if (!fn(st.items)) return;
+      writeState(addr, st.items);
+    });
   }
 
   // The herdr terminal this omo runs in: hc ls carries no pids, but hc get
@@ -123,6 +157,12 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
   }
 
+  // hc-relayed messages arrive wrapped in an envelope; keep only the text.
+  function unwrapEnvelope(text: string): string {
+    const m = /^\s*<hc from="[^"]*">([\s\S]*)<\/hc>\s*$/.exec(text);
+    return m ? m[1] : text;
+  }
+
   function prefixes(text: string, fromEnd: boolean): string[] {
     const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length >= ANCHOR_MIN_LEN);
     const picked = fromEnd ? lines.slice(-ANCHOR_LINES) : lines.slice(0, ANCHOR_LINES);
@@ -137,7 +177,10 @@ export default function (pi: ExtensionAPI) {
         if (r.code !== 0) return;
         const parsed = JSON.parse(r.stdout) as { terminals?: Array<{ address?: string }> };
         const live = new Set((parsed.terminals ?? []).map((t) => t.address));
-        for (const f of readdirSync(stateDir).filter((x) => x.endsWith(".json"))) {
+        for (const f of readdirSync(stateDir).filter((x: string) => x.endsWith(".json"))) {
+          try {
+            chmodSync(join(stateDir, f), 0o600);
+          } catch {}
           const addr = decodeURIComponent(f.slice(0, -".json".length));
           if (!live.has(addr)) {
             try {
@@ -149,17 +192,35 @@ export default function (pi: ExtensionAPI) {
       .catch(() => {});
   }
 
+  // A typed /rename leaves "Session name set: <name>" on the terminal; a title
+  // omo or an agent set does not. One tail read per title event keeps only
+  // what the person actually typed.
+  async function wasTypedRename(addr: string, name: string): Promise<boolean> {
+    try {
+      const r = await pi.exec("hc", ["read", addr, "--lines", "8"], { timeout: 5000 });
+      if (r.code !== 0) return false;
+      // The marker sits a few lines above the bottom bar (input line, status);
+      // scan the last committed lines, not just the tail.
+      const tail = r.stdout.split("\n").filter((l: string) => l.trim()).slice(-12);
+      return tail.some((l: string) => l.includes("Session name set:") && l.includes(name));
+    } catch {
+      return false;
+    }
+  }
+
   pi.on("session_info_changed", async (event: { name?: string }) => {
     try {
       const addr = await resolveAddress();
       if (!addr) return;
       const title = (event.name ?? "").slice(0, 80);
       if (!title) return;
-      mutate(addr, (items) => {
-        const last = items[items.length - 1];
-        if (last && last.title === title) return false;
-        items.push({ title, ts: Date.now() });
-        return true;
+      if (!(await wasTypedRename(addr, event.name ?? ""))) return;
+      await serialized(() => {
+        const st = readState(addr);
+        const last = st.items[st.items.length - 1];
+        if (last && last.title === title) return;
+        st.items.push({ num: 0, title, ts: Date.now() });
+        writeState(addr, st.items);
       });
     } catch {}
   });
@@ -168,15 +229,17 @@ export default function (pi: ExtensionAPI) {
     try {
       if (event.message?.role !== "user") return;
       const text = textOf(event.message);
-      if (!text.trim() || text.trim().startsWith("/")) return;
+      if (!text.trim()) return;
+      if (text.trim().startsWith("/")) return;
       const anchor = prefixes(text, false);
-      if (!anchor.length) return;
+      const prompt = unwrapEnvelope(text).trim().slice(0, PROMPT_MAX);
       const addr = await resolveAddress();
       if (!addr) return;
-      mutate(addr, (items) => {
+      await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (!items[i].promptAnchor) {
             items[i].promptAnchor = anchor;
+            items[i].prompt = prompt;
             return true;
           }
         }
@@ -185,16 +248,30 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   });
 
-  pi.on("turn_end", async (event: { message?: { role?: string; content?: unknown } }) => {
+  pi.on("agent_end", async (event: { messages?: Array<{ role?: string; content?: unknown }> }) => {
     try {
-      const anchor = prefixes(textOf(event.message), true);
-      if (!anchor.length) return;
+      // event.messages holds the whole run; the last assistant text in it is
+      // the final report, whatever tool-call sub-turns ran before it. Writing
+      // on every agent_end (retries included) leaves the last run's answer on
+      // the item. The /rename confirmation is a run too; skip its one-liner.
+      let text = "";
+      for (const m of Array.isArray(event.messages) ? event.messages : []) {
+        if (m?.role !== "assistant") continue;
+        const t = textOf(m).trim();
+        if (t) text = t;
+      }
+      if (!text) return;
+      if (text.length < 240 && /session name set|세션 이름|thread_rename|rename/i.test(text)) return;
+      const anchor = prefixes(text, true);
+      // Conclusions and next steps live at the end; overflow keeps the tail.
+      const report = text.length > REPORT_MAX ? text.slice(-REPORT_MAX) : text;
       const addr = await resolveAddress();
       if (!addr) return;
-      mutate(addr, (items) => {
+      await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
-          if (!items[i].reportAnchor) {
-            items[i].reportAnchor = anchor;
+          if (items[i].promptAnchor) {
+            if (anchor.length) items[i].reportAnchor = anchor;
+            items[i].report = report;
             return true;
           }
         }
