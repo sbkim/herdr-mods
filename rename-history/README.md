@@ -23,10 +23,15 @@ with the omo agent's terminals (see Limits).
 - Only a `/rename` the person actually typed is recorded (the extension
   checks the terminal's tail for the "Session name set" line; titles omo or
   an agent set on their own are filtered out).
-- **Session-scoped**: the file carries the writing session's id. Resuming the
-  same session (`omo --session …` after `/exit`) keeps its history; any other
-  session started in that terminal (a fresh omo, `/new`) archives the file
-  whole and starts over at 1. `/exit` itself keeps everything.
+- **Session-scoped**: the file carries the writing session's id (read from
+  the handler context the host provides). Resuming the same session
+  (`omo --session …` after `/exit`) keeps its history; any other session
+  started in that terminal (a fresh omo, `/new`) archives the file whole
+  and starts over at 1 — at that session's first recorded event, so until
+  then the menu can still show the previous session's rows. `/exit` keeps
+  the file; when the terminal itself disappears, the next load archives it
+  instead of discarding it. A host that never provides a session id records
+  terminal-keyed, exactly as before.
 - The full prompt (up to 1,000 characters) and the final report (the last
   assistant text of the run, up to 4,000 characters keeping the conclusion
   side) are stored beside the anchors, so a report stays readable even after
@@ -92,11 +97,13 @@ session's** history:
 
 Numbers are reassigned densely 1..N (oldest first) on every write. A
 different session starting in the terminal moves the file whole into
-`data/rename-history/archive/<address>/<session>.json` (a version-2 file
-with no session id archives as `legacy-v2-<time>.json`). Archives keep the
-**newest 10 sessions per terminal for 30 days**, within a **20 MB** total
-cap. The store holds report text, so it is created with the folder at mode
-700 and the files at 600.
+`data/rename-history/archive/<address>/<encoded session>-<time>.json` (a
+file with no session id archives as `unlabeled-<time>.json`), so
+re-archiving a session never overwrites its earlier snapshot. Archives keep
+the **newest 10 sessions per terminal for 30 days from archive time**,
+within a **20 MB** total cap; entries the extension did not write are
+ignored. The store holds report text, so it is created with the folder at
+mode 700 and the files at 600.
 
 Tools built on the state files (voice assistants, agents) read the terminal
 file for the current session and can list `archive/<address>/` and read a
@@ -116,6 +123,9 @@ file by session id for past sessions.
   rather than a report.
 - The menu shows the **12** most recent titles; **50** are kept per terminal.
 - Remote terminals (another machine) are not supported.
+- Terminal discovery tries up to **24** live omo terminals per lookup.
+- Trimming runs in every omo process; two processes archiving at the same
+  instant can in principle race a trim (accepted, single-user rare).
 
 ## Privacy & reach
 

@@ -92,7 +92,10 @@ restarted, a right-click shows the usual items plus RENAME HISTORY once the
 extension has recorded a title, each row labelled "N. title"; a title omo or
 the agent set on its own never appears; resuming with `--session` keeps the
 history while a fresh omo or `/new` in that terminal archives the file and
-restarts at 1; picking an old title scrolls the
+restarts at 1; an A→B→A cycle leaves every earlier snapshot intact
+(timestamped archive names), the /new race cannot archive the current
+session's own file, a failed archive never merges histories, and a terminal
+leaving `hc ls` has its file archived by the next load; picking an old title scrolls the
 terminal to its report (or shows the tail dialog when the position is gone);
 "+N older" appears beyond 12 bookmarks, 50 are kept and dense numbering
 survives eviction; the state file holds prompt and report text at 600; a plain right-click on a shell

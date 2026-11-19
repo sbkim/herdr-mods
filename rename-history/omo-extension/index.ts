@@ -40,7 +40,7 @@
 // silent, and nothing is written to the screen.
 
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_ITEMS = 50;
@@ -83,16 +83,19 @@ export default function (pi: ExtensionAPI) {
   let addressResolved = false;
   let sessionAdopted = false;
 
-  // This session's id when the host exposes it; "" when it does not (then
-  // the store keeps whatever it holds — never a wrong reset).
-  function mySession(): string {
+  // The session id lives on the handler context (docs/extensions.md:
+  // ctx.sessionManager), never on pi; the first handler to see it caches it.
+  // "" until then — and only if the host never provides one, in which case
+  // the store keeps whatever it holds (never a wrong reset).
+  let sessionId = "";
+  function sessionOf(ctx: unknown): string {
     try {
-      const id = (pi as { sessionManager?: { getSessionId?: () => unknown } }).sessionManager?.getSessionId?.();
-      return typeof id === "string" && id.length > 0 ? id : "";
-    } catch {
-      return "";
-    }
+      const id = (ctx as { sessionManager?: { getSessionId?: () => unknown } } | null | undefined)?.sessionManager?.getSessionId?.();
+      if (typeof id === "string" && id.length > 0) sessionId = id;
+    } catch {}
+    return sessionId;
   }
+  const mySession = (): string => sessionId;
 
   function fileOf(addr: string): string {
     // Remote addresses contain "/" (vps/t7); percent-encoding keeps one file
@@ -145,27 +148,46 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  // Move the terminal's current file into its archive slot, whole. The file
-  // is gone afterwards, so the next write starts this session fresh at 1.
-  function archiveState(addr: string): void {
+  // Archives are "<encoded session>-<archived-at ms>.json": re-archiving a
+  // session never overwrites an earlier snapshot, and the encoded name
+  // cannot leave the archive directory. The mtime is stamped fresh at
+  // archive time (the rename would keep a stale one and the 30-day trim
+  // would delete the file on arrival). True when the terminal file is gone
+  // afterwards — archived, or never there.
+  function archiveState(addr: string): boolean {
+    const file = fileOf(addr);
+    if (!existsSync(file)) {
+      trimArchives();
+      return true;
+    }
     try {
-      const file = fileOf(addr);
-      if (!existsSync(file)) return;
       let session = "";
       try {
         session = String((JSON.parse(readFileSync(file, "utf8")) as { session?: string }).session ?? "");
       } catch {}
-      const name = session || "legacy-v2-" + Date.now();
+      const safe = session ? encodeURIComponent(session).slice(0, 80) : "";
+      const name = (safe || "unlabeled") + "-" + Date.now();
       const dir = join(ARCHIVE_DIR, encodeURIComponent(addr));
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      renameSync(file, join(dir, name + ".json"));
-    } catch {}
-    trimArchives();
+      const dest = join(dir, name + ".json");
+      renameSync(file, dest);
+      const now = new Date();
+      try {
+        utimesSync(dest, now, now);
+      } catch {}
+      trimArchives(dest);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  // Per terminal keep the newest ARCHIVE_KEEP sessions no older than
-  // ARCHIVE_DAYS; across all terminals stay under ARCHIVE_TOTAL bytes.
-  function trimArchives(): void {
+  // Per terminal keep the newest ARCHIVE_KEEP *.json archives no older than
+  // ARCHIVE_DAYS (from archive time); across all terminals stay under
+  // ARCHIVE_TOTAL bytes. Entries we did not write are ignored, never
+  // deleted; a failed unlink retries on the next trim; keepPath (the file
+  // just archived) always survives.
+  function trimArchives(keepPath?: string): void {
     try {
       const cutoff = Date.now() - ARCHIVE_DAYS * 86_400_000;
       const live: { p: string; m: number; s: number }[] = [];
@@ -178,6 +200,7 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
         const files = names
+          .filter((n) => n.endsWith(".json"))
           .map((n) => {
             const q = join(sub, n);
             try {
@@ -188,13 +211,13 @@ export default function (pi: ExtensionAPI) {
           })
           .filter((x): x is { p: string; m: number; s: number } => x !== null)
           .sort((a, b) => b.m - a.m);
-        files.slice(ARCHIVE_KEEP).forEach((f) => {
-          try {
-            unlinkSync(f.p);
-          } catch {}
-        });
-        for (const f of files.slice(0, ARCHIVE_KEEP)) {
-          if (f.m < cutoff) {
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          if (f.p === keepPath) {
+            live.push(f);
+            continue;
+          }
+          if (i >= ARCHIVE_KEEP || f.m < cutoff) {
             try {
               unlinkSync(f.p);
             } catch {}
@@ -208,29 +231,43 @@ export default function (pi: ExtensionAPI) {
         live.sort((a, b) => a.m - b.m);
         for (const f of live) {
           if (total <= ARCHIVE_TOTAL) break;
+          if (f.p === keepPath) continue;
           try {
             unlinkSync(f.p);
             total -= f.s;
-          } catch {}
+          } catch {
+            break;
+          }
         }
       }
     } catch {}
   }
 
   // Once per process, before this session's first state change: make the
-  // store this session's. A file written by another session of this terminal
-  // is archived whole; a file this very session wrote (--session resume)
-  // stays as it is.
-  async function adopt(addr: string): Promise<void> {
-    if (sessionAdopted) return;
-    sessionAdopted = true;
+  // store this session's. A file written by another session of this
+  // terminal is archived whole; a file this very session wrote (--session
+  // resume) stays as it is. False when adoption did not complete (no
+  // session id yet, or the archive failed): the caller drops the event and
+  // the next one retries, so an old history is never silently merged.
+  async function adopt(addr: string): Promise<boolean> {
+    if (sessionAdopted) return true;
+    const mine = mySession();
+    // No id from this host: record terminal-keyed, exactly as before session
+    // scoping existed (never block recording on a missing id).
+    if (!mine) {
+      sessionAdopted = true;
+      return true;
+    }
+    let ok = true;
     await serialized(() => {
+      let raw: { session?: string } | null = null;
       try {
-        const raw = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { session?: string };
-        const mine = mySession();
-        if (mine && raw.session !== mine) archiveState(addr);
+        raw = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { session?: string };
       } catch {}
+      if (raw && raw.session !== mine) ok = archiveState(addr);
     });
+    sessionAdopted = ok;
+    return ok;
   }
 
   // The herdr terminal this omo runs in: hc ls carries no pids, but hc get
@@ -240,7 +277,7 @@ export default function (pi: ExtensionAPI) {
   // preferred set can hold only other terminals while this one hides in the
   // sweep. hc get calls are capped per attempt, and only a hit is cached —
   // a miss is retried on the next event (addressResolved stays false).
-  const GET_CAP = 12;
+  const GET_CAP = 24;
   async function resolveAddress(): Promise<string | null> {
     if (addressResolved) return address;
     const me = String(process.pid);
@@ -319,11 +356,7 @@ export default function (pi: ExtensionAPI) {
             chmodSync(join(stateDir, f), 0o600);
           } catch {}
           const addr = decodeURIComponent(f.slice(0, -".json".length));
-          if (!live.has(addr)) {
-            try {
-              unlinkSync(join(stateDir, f));
-            } catch {}
-          }
+          if (!live.has(addr)) archiveState(addr); // a dead terminal's last session is archived, not discarded
         }
       })
       .catch(() => {});
@@ -345,11 +378,12 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("session_info_changed", async (event: { name?: string }) => {
+  pi.on("session_info_changed", async (event: { name?: string }, ctx: unknown) => {
     try {
+      sessionOf(ctx);
       const addr = await resolveAddress();
       if (!addr) return;
-      await adopt(addr);
+      if (!(await adopt(addr))) return;
       const title = (event.name ?? "").slice(0, 80);
       if (!title) return;
       if (!(await wasTypedRename(addr, event.name ?? ""))) return;
@@ -363,8 +397,9 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   });
 
-  pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }) => {
+  pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }, ctx: unknown) => {
     try {
+      sessionOf(ctx);
       if (event.message?.role !== "user") return;
       const text = textOf(event.message);
       if (!text.trim()) return;
@@ -373,7 +408,7 @@ export default function (pi: ExtensionAPI) {
       const prompt = unwrapEnvelope(text).trim().slice(0, PROMPT_MAX);
       const addr = await resolveAddress();
       if (!addr) return;
-      await adopt(addr);
+      if (!(await adopt(addr))) return;
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (!items[i].promptAnchor) {
@@ -387,8 +422,9 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   });
 
-  pi.on("agent_end", async (event: { messages?: Array<{ role?: string; content?: unknown }> }) => {
+  pi.on("agent_end", async (event: { messages?: Array<{ role?: string; content?: unknown }> }, ctx: unknown) => {
     try {
+      sessionOf(ctx);
       // event.messages holds the whole run; the last assistant text in it is
       // the final report, whatever tool-call sub-turns ran before it. Writing
       // on every agent_end (retries included) leaves the last run's answer on
@@ -406,7 +442,7 @@ export default function (pi: ExtensionAPI) {
       const report = text.length > REPORT_MAX ? text.slice(-REPORT_MAX) : text;
       const addr = await resolveAddress();
       if (!addr) return;
-      await adopt(addr);
+      if (!(await adopt(addr))) return;
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (items[i].promptAnchor) {
@@ -420,13 +456,19 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   });
 
-  pi.on("session_start", async (event: { reason?: string }) => {
+  pi.on("session_start", async (event: { reason?: string }, ctx: unknown) => {
     try {
+      sessionOf(ctx);
       if (event.reason !== "new") return;
       const addr = await resolveAddress();
       if (!addr) return;
-      sessionAdopted = true;
-      archiveState(addr);
+      await serialized(() => {
+        // Only when this session has not adopted the store yet: once it has,
+        // the file on disk is this session's own, and the /new race must not
+        // archive it (a mid-session /new resets through the id change).
+        if (sessionAdopted) return;
+        sessionAdopted = archiveState(addr);
+      });
     } catch {}
   });
 
