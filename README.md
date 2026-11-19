@@ -10,7 +10,7 @@ brief another agent can rebuild it from) and a `preview.png`.
 | Mod | What it does |
 | --- | --- |
 | [terminal-numbers](terminal-numbers/) | A big sticky number on every terminal's pane header; click a number to renumber or swap, and export the number-to-terminal map for outside tools (voice assistants, agents). |
-| rename-history | *in preparation* |
+| [rename-history](rename-history/) | The terminal right-click menu with a RENAME HISTORY section: every /rename title the terminal has seen, newest first; pick one to jump back to its report. Needs its omo extension. |
 
 ## Installing
 

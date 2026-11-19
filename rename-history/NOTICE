@@ -1,0 +1,8 @@
+rename-history
+
+This mod is a derivative of the shipped `menu` context-menu mod of the Herdr
+app (https://github.com/herdrdev/herdr-app), which is Copyright the Herdr
+authors and licensed under the Apache License, Version 2.0 (LICENSE-APACHE in
+this folder). The item icons it draws at run time come from Herdr's shipped
+`workspace-chrome` mod in your installation; they are not redistributed here.
+The rest of this folder is MIT (the repository LICENSE).
