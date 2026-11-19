@@ -125,33 +125,55 @@ export default function (pi: ExtensionAPI) {
   }
 
   // The herdr terminal this omo runs in: hc ls carries no pids, but hc get
-  // lists the foreground program, which is this process. Agent terminals in
-  // this cwd are tried first, then every live terminal. Resolved once per
-  // session and cached.
+  // lists the foreground program, which is this process. omo terminals the
+  // core still places in this cwd are tried first, then every other live omo
+  // terminal: the core's cwd stays stale after a plain cd (no OSC 7), so the
+  // preferred set can hold only other terminals while this one hides in the
+  // sweep. hc get calls are capped per attempt, and only a hit is cached —
+  // a miss is retried on the next event (addressResolved stays false).
+  const GET_CAP = 12;
   async function resolveAddress(): Promise<string | null> {
     if (addressResolved) return address;
-    addressResolved = true;
+    const me = String(process.pid);
+    let gets = 0;
+    const isMe = async (addr: string): Promise<boolean> => {
+      if (gets >= GET_CAP) return false;
+      gets++;
+      try {
+        const g = await pi.exec("hc", ["get", addr, "--json"], { timeout: 5000 });
+        if (g.code !== 0) return false;
+        const rec = JSON.parse(g.stdout) as { foreground?: { pid?: number } };
+        return rec.foreground != null && String(rec.foreground.pid) === me;
+      } catch {
+        return false;
+      }
+    };
     try {
       const ls = await pi.exec("hc", ["ls", "--json"], { timeout: 5000 });
       if (ls.code !== 0) return null;
       const parsed = JSON.parse(ls.stdout) as { terminals?: Array<{ address?: string; agent?: string; cwd?: string; state?: string }> };
       const all = (parsed.terminals ?? []).filter((t) => t.address && t.state !== "finished");
-      const candidates = all.filter((t) => t.agent === "omo" && t.cwd === process.cwd());
-      const pool = candidates.length ? candidates : all.slice(0, 12);
-      const me = String(process.pid);
-      for (const t of pool) {
-        const g = await pi.exec("hc", ["get", t.address ?? "", "--json"], { timeout: 5000 });
-        if (g.code !== 0) continue;
-        const rec = JSON.parse(g.stdout) as { foreground?: { pid?: number } };
-        if (rec.foreground && String(rec.foreground.pid) === me) {
-          address = t.address ?? null;
-          break;
+      const omos = all.filter((t) => t.agent === "omo");
+      const preferred = omos.filter((t) => t.cwd === process.cwd());
+      for (const t of preferred) {
+        if (await isMe(t.address!)) {
+          address = t.address!;
+          addressResolved = true;
+          return address;
+        }
+      }
+      for (const t of omos) {
+        if (preferred.includes(t)) continue;
+        if (await isMe(t.address!)) {
+          address = t.address!;
+          addressResolved = true;
+          return address;
         }
       }
     } catch {
-      address = null;
+      // unresolved: fall through uncached
     }
-    return address;
+    return null;
   }
 
   function textOf(message: { content?: unknown } | undefined | null): string {
