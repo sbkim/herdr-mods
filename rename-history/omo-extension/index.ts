@@ -85,8 +85,12 @@ function real(p: string): string {
 // such a detour and create the store in another tree.
 function storePathIsHonest(): boolean {
   const want = resolve(stateDirOf());
-  const anc = real(want);
-  return anc === want || anc === real(dirname(want)) || want.startsWith(anc + sep);
+  const anc = real(want); // nearest EXISTING ancestor, fully resolved
+  // honest iff the ancestor IS the expectation, or the expectation extends
+  // it by exactly the still-missing suffix (no symlink in between: a detour
+  // would make the resolved ancestor differ from the built-up prefix).
+  if (anc === want) return true;
+  return want.startsWith(anc + sep) && resolve(anc + sep + want.slice(anc.length + sep.length)) === want;
 }
 function insideStore(p: string): boolean {
   const root = real(stateDirOf());
@@ -121,6 +125,7 @@ export default function (pi: ExtensionAPI) {
   let addressResolved = false;
   let sessionAdopted = false;
   let ownWrites = 0; // writes THIS instance made: the stale-writer drop applies only after them
+  let lastOwnAddr = ""; // the terminal this instance records
   let resetPending = false; // a /new whose archive failed: the next event retries it before anything else
 
   // The session id lives on the handler context (docs/extensions.md:
@@ -184,10 +189,11 @@ export default function (pi: ExtensionAPI) {
     try {
       const kept = items.slice(-MAX_ITEMS);
       kept.forEach((it, i) => (it.num = i + 1));
-      mkdirSync(stateDirOf(), { recursive: true, mode: 0o700 });
       const file = fileOf(addr);
       if (!insideStore(file)) return false;
       if (!storePathIsHonest() || !insideStore(file) || !insideStore(stateDirOf())) return false; // before any creation
+      if (!existsSync(stateDirOf())) mkdirSync(stateDirOf(), { recursive: true, mode: 0o700 });
+      if (!storePathIsHonest() || !insideStore(stateDirOf())) return false; // revalidate after creation
       const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
       if (existsSync(tmp) || !insideStore(tmp)) return; // fresh exclusive path only
       writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600, flag: "wx" });
@@ -232,6 +238,7 @@ export default function (pi: ExtensionAPI) {
       }
       const items = foreign ? [] : st.items;
       if (!fn(items)) return;
+      lastOwnAddr = addr;
       if (writeState(addr, items)) ownWrites++;
     });
   }
@@ -270,7 +277,7 @@ export default function (pi: ExtensionAPI) {
       for (let n = 1; existsSync(dest); n++) dest = join(dir, name + "-" + n + ".json");
       if (!insideStore(dest)) return false;
       renameSync(file, dest);
-      ownWrites = 0; // we archived: any absence after this is a foreign reset until we write again
+      if (file === fileOf(lastOwnAddr)) ownWrites = 0; // we archived OUR terminal's file: a later absence is a foreign reset
       const now = new Date();
       try {
         utimesSync(dest, now, now);
