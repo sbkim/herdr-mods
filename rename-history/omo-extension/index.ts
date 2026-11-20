@@ -22,13 +22,18 @@
 //   recorded.
 // - /new is session_start with reason "new"; it resets the screen, so the
 //   terminal's file is deleted outright.
-// - message_end (role "user") and turn_end carry the message text; short line
+// - message_end (role "user") and agent_end carry the message text; short line
 //   prefixes of the prompt and of the report's tail serve as scrollback
 //   anchors — the mod locates them with one `hc read` at jump time, because
 //   neither the extension nor hc can read the view's scroll position. Lines
 //   under 4 characters are not distinctive enough to anchor and are dropped.
 //   The full prompt (1,000 chars) and report (4,000 chars) are kept alongside,
-//   so a report stays readable after the scrollback is gone.
+//   so a report stays readable after the scrollback is gone. A prompt fills
+//   only the last item and only while it has no prompt yet; the report then
+//   pairs with that item by identity {ts, title} — never by position, because
+//   the 50-item slice, /new and foreign resets all shift indices. A turn that
+//   fills no prompt (the marked rename never happened, or a steering message
+//   arrived after the prompt) records no report at all.
 // - Bookmarks are numbered oldest-first from 1; an eviction under the
 //   50-item cap never renumbers what remains.
 // - The store is session-scoped: the file carries the writing session's id.
@@ -138,6 +143,13 @@ export default function (pi: ExtensionAPI) {
   let ownWrites = 0; // writes THIS instance made: the stale-writer drop applies only after them
   let lastOwnAddr = ""; // the terminal this instance records
   let resetPending = false; // a /new whose archive failed: the next event retries it before anything else
+  // The item the current turn's report pairs with: the identity {ts, title}
+  // the item carried when the turn's prompt filled it — never an array index,
+  // which the 50-item slice, /new and foreign resets all shift. Null when the
+  // turn has no filled item; a report then writes nothing instead of landing
+  // on an older bookmark. Survives agent_end, so a retry turn (an agent_end
+  // with no message_end since) refreshes the same item with its newest report.
+  let bound: { ts: number; title: string } | null = null;
 
   // The session id lives on the handler context (docs/extensions.md:
   // ctx.sessionManager), never on pi; the first handler to see it caches it.
@@ -232,6 +244,7 @@ export default function (pi: ExtensionAPI) {
         if (!fn([])) return; // does not qualify: the pending reset waits for one that does
         if (!archiveState(addr)) return; // still blocked: keep waiting
         resetPending = false;
+        bound = null; // our pending /new reset completed: the old items are archived away
         const fresh: Bookmark[] = [];
         if (!fn(fresh)) return;
         if (writeState(addr, fresh)) ownWrites++;
@@ -246,6 +259,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (foreign) {
         if (!archiveState(addr)) return; // archive failed: retry on a later event
+        bound = null; // the store was reset out from under this turn: nothing pairs anymore
       }
       const items = foreign ? [] : st.items;
       if (!fn(items)) return;
@@ -429,8 +443,16 @@ export default function (pi: ExtensionAPI) {
   // sweep. hc get calls are capped per attempt, and only a hit is cached —
   // a miss is retried on the next event (addressResolved stays false).
   const GET_CAP = 24;
-  async function resolveAddress(): Promise<string | null> {
-    if (addressResolved) return address;
+  // One sweep at a time: concurrent callers — a first prompt racing the
+  // session_start warm-up — share the in-flight promise instead of each
+  // queuing a full sweep of hc calls behind the other.
+  let addressSweep: Promise<string | null> | null = null;
+  function resolveAddress(): Promise<string | null> {
+    if (addressResolved) return Promise.resolve(address);
+    if (!addressSweep) addressSweep = sweepAddress().finally(() => { addressSweep = null; });
+    return addressSweep;
+  }
+  async function sweepAddress(): Promise<string | null> {
     const me = String(process.pid);
     let gets = 0;
     const isMe = async (addr: string): Promise<boolean> => {
@@ -567,14 +589,21 @@ export default function (pi: ExtensionAPI) {
       const addr = await resolveAddress();
       if (!addr) return;
       await mutate(addr, (items) => {
-        for (let i = items.length - 1; i >= 0; i--) {
-          if (!items[i].promptAnchor) {
-            items[i].promptAnchor = anchor;
-            items[i].prompt = prompt;
-            return true;
-          }
+        // The prompt fills only the LAST item, and only while it has none: the
+        // prompt belongs to this turn's own bookmark. A steering message after
+        // the prompt already filled — or a turn whose marked rename never
+        // happened, leaving nothing fresh to fill — writes nothing and breaks
+        // any previous binding, so a later report cannot land on an older
+        // item (GAP-3, GAP-4).
+        const last = items[items.length - 1];
+        if (!last || last.promptAnchor) {
+          bound = null;
+          return false;
         }
-        return false;
+        last.promptAnchor = anchor;
+        last.prompt = prompt;
+        bound = { ts: last.ts, title: last.title };
+        return true;
       });
     } catch {}
   });
@@ -600,14 +629,17 @@ export default function (pi: ExtensionAPI) {
       const addr = await resolveAddress();
       if (!addr) return;
       await mutate(addr, (items) => {
-        for (let i = items.length - 1; i >= 0; i--) {
-          if (items[i].promptAnchor) {
-            if (anchor.length) items[i].reportAnchor = anchor;
-            items[i].report = report;
-            return true;
-          }
-        }
-        return false;
+        // Only the item this turn's prompt bound — found by identity, since
+        // the slice and resets can have moved it since. No binding (missed
+        // rename, steering turn, /new, foreign reset) or no match writes
+        // nothing. The binding survives, so a retry refreshes the same item.
+        const id = bound;
+        if (!id) return false;
+        const it = items.find((x) => x.ts === id.ts && x.title === id.title);
+        if (!it) return false;
+        if (anchor.length) it.reportAnchor = anchor;
+        it.report = report;
+        return true;
       });
     } catch {}
   });
@@ -615,7 +647,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event: { reason?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
+      // Warm the sweep for EVERY start reason: a first prompt in a fresh or
+      // resumed session then shares the in-flight resolution instead of
+      // queueing its own hc sweep behind it.
+      resolveAddress().catch(() => {});
       if (event.reason !== "new") return;
+      bound = null; // the reset ends the previous turn sequence: no report pairs across it
       const addr = await resolveAddress();
       if (!addr) return;
       await serialized(() => {
