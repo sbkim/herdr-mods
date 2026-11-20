@@ -126,6 +126,16 @@ file by session id for past sessions.
 - Terminal discovery tries up to **24** live omo terminals per lookup.
 - Trimming runs in every omo process; two processes archiving at the same
   instant can in principle race a trim (accepted, single-user rare).
+- **Known limitation (accepted)**: if a terminal's `hc ls` listing is
+  briefly stale while another omo loads, that terminal's file can be
+  archived mid-session and its popup restarts empty from the next `/rename`
+  (data is preserved, never lost). **Recovery**: the archived rows live in
+  `~/.config/herdr-app/data/rename-history/archive/<terminal address>/` —
+  if a popup suddenly empties, look there. `/new` always changes the
+  session id (measured on omo 5.1.79), so mid-session same-id resets do
+  not occur.
+- The reset promise applies when the popup is **reopened**; an already-open
+  popup keeps the rows it loaded.
 
 ## Privacy & reach
 

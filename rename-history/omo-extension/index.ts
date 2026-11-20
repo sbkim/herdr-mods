@@ -80,6 +80,14 @@ function real(p: string): string {
     }
   }
 }
+// The store path itself must not traverse a symlink between its nearest
+// existing ancestor and the resolved expectation: mkdirSync would follow
+// such a detour and create the store in another tree.
+function storePathIsHonest(): boolean {
+  const want = resolve(stateDirOf());
+  const anc = real(want);
+  return anc === want || anc === real(dirname(want)) || want.startsWith(anc + sep);
+}
 function insideStore(p: string): boolean {
   const root = real(stateDirOf());
   const target = real(p);
@@ -113,7 +121,6 @@ export default function (pi: ExtensionAPI) {
   let addressResolved = false;
   let sessionAdopted = false;
   let ownWrites = 0; // writes THIS instance made: the stale-writer drop applies only after them
-  let justArchivedByUs = false; // archived by adopt/archiveState in THIS event (a legitimate fresh start)
   let resetPending = false; // a /new whose archive failed: the next event retries it before anything else
 
   // The session id lives on the handler context (docs/extensions.md:
@@ -179,7 +186,8 @@ export default function (pi: ExtensionAPI) {
       kept.forEach((it, i) => (it.num = i + 1));
       mkdirSync(stateDirOf(), { recursive: true, mode: 0o700 });
       const file = fileOf(addr);
-      if (!insideStore(file)) return;
+      if (!insideStore(file)) return false;
+      if (!storePathIsHonest() || !insideStore(file) || !insideStore(stateDirOf())) return false; // before any creation
       const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
       if (existsSync(tmp) || !insideStore(tmp)) return; // fresh exclusive path only
       writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600, flag: "wx" });
@@ -212,14 +220,15 @@ export default function (pi: ExtensionAPI) {
         if (writeState(addr, fresh)) ownWrites++;
         return;
       }
-      const foreign = st.corrupt || (st.session !== "" && st.session !== sessionId);
+      // A legacy no-session file counts as foreign once we know our id:
+      // prompt/report events then adopt (archive) it instead of restamping.
+      const foreign = st.corrupt || (sessionId !== "" ? st.session !== sessionId : st.session !== "" && st.session !== sessionId);
       if (foreign && !fn([])) return; // the event does not qualify: never archive for it
       if (st.absent) {
-        if (!justArchivedByUs && ownWrites > 0) return; // we wrote it and it vanished without us archiving: another instance reset this terminal
+        if (ownWrites > 0) return; // we wrote it and it vanished without us archiving: another instance reset this terminal
       }
       if (foreign) {
         if (!archiveState(addr)) return; // archive failed: retry on a later event
-        justArchivedByUs = true;
       }
       const items = foreign ? [] : st.items;
       if (!fn(items)) return;
@@ -261,7 +270,7 @@ export default function (pi: ExtensionAPI) {
       for (let n = 1; existsSync(dest); n++) dest = join(dir, name + "-" + n + ".json");
       if (!insideStore(dest)) return false;
       renameSync(file, dest);
-      justArchivedByUs = true;
+      ownWrites = 0; // we archived: any absence after this is a foreign reset until we write again
       const now = new Date();
       try {
         utimesSync(dest, now, now);
@@ -513,7 +522,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_info_changed", async (event: { name?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
-      justArchivedByUs = false; // event boundary
       const addr = await resolveAddress();
       if (!addr) return;
       const title = (event.name ?? "").slice(0, 80);
@@ -535,7 +543,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }, ctx: unknown) => {
     try {
       sessionOf(ctx);
-      justArchivedByUs = false; // event boundary
       if (event.message?.role !== "user") return;
       const text = textOf(event.message);
       if (!text.trim()) return;
@@ -560,7 +567,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event: { messages?: Array<{ role?: string; content?: unknown }> }, ctx: unknown) => {
     try {
       sessionOf(ctx);
-      justArchivedByUs = false; // event boundary
       // event.messages holds the whole run; the last assistant text in it is
       // the final report, whatever tool-call sub-turns ran before it. Writing
       // on every agent_end (retries included) leaves the last run's answer on
@@ -594,7 +600,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event: { reason?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
-      justArchivedByUs = false; // event boundary
       if (event.reason !== "new") return;
       const addr = await resolveAddress();
       if (!addr) return;
@@ -604,6 +609,7 @@ export default function (pi: ExtensionAPI) {
         // archive it (a mid-session /new resets through the id change).
         if (sessionAdopted) return;
         sessionAdopted = archiveState(addr);
+        if (sessionAdopted) ownWrites = 0; // a reset by us: later absences are not stale
         resetPending = !sessionAdopted; // blocked: retry the reset on the next event
       });
     } catch {}
