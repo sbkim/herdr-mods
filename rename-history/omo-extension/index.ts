@@ -40,7 +40,9 @@
 // silent, and nothing is written to the screen.
 
 import type { ExtensionAPI } from "@code-yeongyu/senpi";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve, sep } from "node:path";
 import { join } from "node:path";
 
 const MAX_ITEMS = 50;
@@ -53,8 +55,36 @@ const ARCHIVE_DAYS = 30;
 const ARCHIVE_TOTAL = 20 * 1024 * 1024;
 const REPORT_MAX = 4_000;
 
-const stateDir = join(process.env.HOME ?? "", ".config/herdr-app/data/rename-history");
-const ARCHIVE_DIR = join(stateDir, "archive");
+// The store root is resolved at RUN time, never at import time: a host that
+// repoints HOME after loading this module must not send writes to the old
+// root. Every created/written/moved/chmod'd/deleted path must resolve
+// (following symlinks; not-yet-existing targets validate the nearest
+// existing ancestor and are revalidated after creation) inside the store.
+let storeRoot: string | null = null;
+function stateDirOf(): string {
+  if (storeRoot === null) storeRoot = join(process.env.HOME || homedir(), ".config/herdr-app/data/rename-history");
+  return storeRoot;
+}
+function archDirOf(): string {
+  return join(stateDirOf(), "archive");
+}
+function real(p: string): string {
+  let cur = p;
+  for (;;) {
+    try {
+      return realpathSync(cur);
+    } catch {
+      const up = dirname(cur);
+      if (up === cur) return resolve(p);
+      cur = up;
+    }
+  }
+}
+function insideStore(p: string): boolean {
+  const root = real(stateDirOf());
+  const target = real(p);
+  return target === root || target.startsWith(root + sep);
+}
 
 interface Bookmark {
   num: number;
@@ -100,7 +130,7 @@ export default function (pi: ExtensionAPI) {
   function fileOf(addr: string): string {
     // Remote addresses contain "/" (vps/t7); percent-encoding keeps one file
     // per address.
-    return join(stateDir, encodeURIComponent(addr) + ".json");
+    return join(stateDirOf(), encodeURIComponent(addr) + ".json");
   }
 
   // Handlers run concurrently (each awaits address resolution first); their
@@ -132,11 +162,13 @@ export default function (pi: ExtensionAPI) {
     try {
       const kept = items.slice(-MAX_ITEMS);
       kept.forEach((it, i) => (it.num = i + 1));
-      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      mkdirSync(stateDirOf(), { recursive: true, mode: 0o700 });
       const file = fileOf(addr);
-      const tmp = `${file}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600 });
-      renameSync(tmp, file);
+      if (!insideStore(file)) return;
+      const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
+      if (existsSync(tmp) || !insideStore(tmp)) return; // fresh exclusive path only
+      writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600, flag: "wx" });
+      if (insideStore(tmp) && insideStore(file)) renameSync(tmp, file);
     } catch {}
   }
 
@@ -167,8 +199,10 @@ export default function (pi: ExtensionAPI) {
       } catch {}
       const safe = session ? encodeURIComponent(session).slice(0, 80) : "";
       const name = (safe || "unlabeled") + "-" + Date.now();
-      const dir = join(ARCHIVE_DIR, encodeURIComponent(addr));
+      const dir = join(archDirOf(), encodeURIComponent(addr));
+      if (!insideStore(dir) || !insideStore(file)) return false; // before any creation
       mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (!insideStore(dir)) return false; // revalidate after creation
       const dest = join(dir, name + ".json");
       renameSync(file, dest);
       const now = new Date();
@@ -191,8 +225,8 @@ export default function (pi: ExtensionAPI) {
     try {
       const cutoff = Date.now() - ARCHIVE_DAYS * 86_400_000;
       const live: { p: string; m: number; s: number }[] = [];
-      for (const d of readdirSync(ARCHIVE_DIR)) {
-        const sub = join(ARCHIVE_DIR, d);
+      for (const d of readdirSync(archDirOf())) {
+        const sub = join(archDirOf(), d);
         let names: string[];
         try {
           names = readdirSync(sub);
@@ -219,7 +253,7 @@ export default function (pi: ExtensionAPI) {
           }
           if (i >= ARCHIVE_KEEP || f.m < cutoff) {
             try {
-              unlinkSync(f.p);
+              if (insideStore(f.p)) unlinkSync(f.p);
             } catch {}
             continue;
           }
@@ -233,7 +267,7 @@ export default function (pi: ExtensionAPI) {
           if (total <= ARCHIVE_TOTAL) break;
           if (f.p === keepPath) continue;
           try {
-            unlinkSync(f.p);
+            if (insideStore(f.p)) unlinkSync(f.p);
             total -= f.s;
           } catch {
             break;
@@ -351,9 +385,11 @@ export default function (pi: ExtensionAPI) {
         if (r.code !== 0) return;
         const parsed = JSON.parse(r.stdout) as { terminals?: Array<{ address?: string }> };
         const live = new Set((parsed.terminals ?? []).map((t) => t.address));
-        for (const f of readdirSync(stateDir).filter((x: string) => x.endsWith(".json"))) {
+        for (const f of readdirSync(stateDirOf()).filter((x: string) => x.endsWith(".json"))) {
           try {
-            chmodSync(join(stateDir, f), 0o600);
+            const sweepPath = join(stateDirOf(), f);
+          if (!insideStore(sweepPath)) return; // outside the store: never touch
+          chmodSync(sweepPath, 0o600);
           } catch {}
           const addr = decodeURIComponent(f.slice(0, -".json".length));
           if (!live.has(addr)) archiveState(addr); // a dead terminal's last session is archived, not discarded
