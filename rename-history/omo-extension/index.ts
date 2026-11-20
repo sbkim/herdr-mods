@@ -31,8 +31,10 @@
 //   so a report stays readable after the scrollback is gone. A prompt fills
 //   only the last item and only while it has no prompt yet; the report then
 //   pairs with that item by identity {ts, title} — never by position, because
-//   the 50-item slice, /new and foreign resets all shift indices. A turn that
-//   fills no prompt (the marked rename never happened, or a steering message
+//   the 50-item slice, /new and foreign resets all shift indices. A pushed
+//   marked rename clears any standing pairing, so a late agent_end after it
+//   writes nothing; the new item pairs at its own prompt. A turn that fills
+//   no prompt (the marked rename never happened, or a steering message
 //   arrived after the prompt) records no report at all.
 // - Bookmarks are numbered oldest-first from 1; an eviction under the
 //   50-item cap never renumbers what remains.
@@ -218,7 +220,7 @@ export default function (pi: ExtensionAPI) {
       if (!existsSync(stateDirOf())) mkdirSync(stateDirOf(), { recursive: true, mode: 0o700 });
       if (!storePathIsHonest() || !insideStore(stateDirOf())) return false; // revalidate after creation
       const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
-      if (existsSync(tmp) || !insideStore(tmp)) return; // fresh exclusive path only
+      if (existsSync(tmp) || !insideStore(tmp)) return false; // fresh exclusive path only
       writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600, flag: "wx" });
       if (insideStore(tmp) && insideStore(file)) {
         renameSync(tmp, file);
@@ -378,7 +380,6 @@ export default function (pi: ExtensionAPI) {
       const evict: string[] = [];
       for (const arr of byDir.values()) {
         arr.sort((x, y) => x.m - y.m); // oldest first
-        let extra = arr.filter((x) => x.p !== keepPath).length - 0;
         let keepCount = arr.length;
         for (const x of arr) {
           if (keepCount <= ARCHIVE_KEEP) break;
@@ -562,7 +563,10 @@ export default function (pi: ExtensionAPI) {
       // a marker-only name empties out and records nothing.
       let end = raw.length;
       while (end > 0 && MARKERS.includes(raw.charAt(end - 1))) end--;
-      const title = raw.slice(0, end).trim().slice(0, 80);
+      // Slice by code points — a UTF-16 unit slice can split a surrogate
+      // pair — and trim again after the cut: the 80th code point can be a
+      // space.
+      const title = Array.from(raw.slice(0, end).trim()).slice(0, 80).join("").trim();
       if (!title) return;
       if (!(await adopt(addr))) return;
       // Through mutate(): unreadable files are never replaced, a file owned
@@ -572,6 +576,7 @@ export default function (pi: ExtensionAPI) {
         const last = items[items.length - 1];
         if (last && last.title === title) return false;
         items.push({ num: 0, title, ts: Date.now() });
+        bound = null; // the pushed item ends any standing pairing: a stray late agent_end must not land its report on the older item; the new item rebinds at its own prompt
         return true;
       });
     } catch {}
@@ -594,7 +599,7 @@ export default function (pi: ExtensionAPI) {
         // the prompt already filled — or a turn whose marked rename never
         // happened, leaving nothing fresh to fill — writes nothing and breaks
         // any previous binding, so a later report cannot land on an older
-        // item (GAP-3, GAP-4).
+        // item.
         const last = items[items.length - 1];
         if (!last || last.promptAnchor) {
           bound = null;
