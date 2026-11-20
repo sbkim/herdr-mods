@@ -12,6 +12,10 @@ brief another agent can rebuild it from) and a `preview.png`.
 | [terminal-numbers](terminal-numbers/) | A big sticky number on every terminal's pane header; click a number to renumber or swap, and export the number-to-terminal map for outside tools (voice assistants, agents). |
 | [rename-history](rename-history/) | The terminal right-click menu with a RENAME HISTORY section: every /rename title the terminal has seen, newest first; pick one to jump back to its report. Needs its omo extension. |
 
+One folder ships an omo extension without its mod: [done-blink](done-blink/)
+holds the stall marker channel for the done-blink badge-pulse mod (the mod
+itself is a personal build on `terminal-numbers` and is not published here).
+
 ## Installing
 
 Mods are small JavaScript programs that run inside Herdr **with your own
