@@ -136,6 +136,13 @@ file by session id for past sessions.
   not occur.
 - The reset promise applies when the popup is **reopened**; an already-open
   popup keeps the rows it loaded.
+- **Accepted limitations (deep races, data always preserved in the archive)**:
+  a relative symlink planted inside the store can redirect an archive's
+  timestamp update; two omo instances sharing one terminal can race an
+  ID-less `/new` or let a late handler from the previous writer take back
+  the active file. None of these lose history — the rows move to
+  `archive/<terminal address>/` — and they require a tampered store or two
+  live writers on one terminal.
 
 ## Privacy & reach
 
