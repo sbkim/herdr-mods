@@ -112,6 +112,9 @@ export default function (pi: ExtensionAPI) {
   let address: string | null = null;
   let addressResolved = false;
   let sessionAdopted = false;
+  let ownWrites = 0; // writes THIS instance made: the stale-writer drop applies only after them
+  let justArchivedByUs = false; // archived by adopt/archiveState in THIS event (a legitimate fresh start)
+  let resetPending = false; // a /new whose archive failed: the next event retries it before anything else
 
   // The session id lives on the handler context (docs/extensions.md:
   // ctx.sessionManager), never on pi; the first handler to see it caches it.
@@ -143,13 +146,25 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Reports can carry secrets; only this user may read the store.
-  function readState(addr: string): { items: Bookmark[] } {
+  type State = { items: Bookmark[]; session: string; absent: boolean; unreadable: boolean; corrupt: boolean };
+  function readState(addr: string): State {
+    const file = fileOf(addr);
+    if (!existsSync(file)) return { items: [], session: "", absent: true, unreadable: false, corrupt: false };
+    let text: string;
     try {
-      const j = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { items?: Bookmark[] };
-      const items = Array.isArray(j.items) ? j.items : [];
-      return { items };
+      text = readFileSync(file, "utf8");
     } catch {
-      return { items: [] };
+      return { items: [], session: "", absent: false, unreadable: true, corrupt: false };
+    }
+    try {
+      const j = JSON.parse(text) as { items?: Bookmark[]; session?: unknown };
+      return {
+        items: Array.isArray(j.items) ? j.items : [],
+        session: typeof j.session === "string" ? j.session : "",
+        absent: false, unreadable: false, corrupt: false,
+      };
+    } catch {
+      return { items: [], session: "", absent: false, unreadable: false, corrupt: true };
     }
   }
 
@@ -158,7 +173,7 @@ export default function (pi: ExtensionAPI) {
   // events (auto retitles, turn forks) come and go, and dense numbering keeps
   // small numbers meaningful for anything reading the store. /new and any
   // new session archive the file, which starts over at 1.
-  function writeState(addr: string, items: Bookmark[]) {
+  function writeState(addr: string, items: Bookmark[]): boolean {
     try {
       const kept = items.slice(-MAX_ITEMS);
       kept.forEach((it, i) => (it.num = i + 1));
@@ -168,15 +183,47 @@ export default function (pi: ExtensionAPI) {
       const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
       if (existsSync(tmp) || !insideStore(tmp)) return; // fresh exclusive path only
       writeFileSync(tmp, JSON.stringify({ v: 3, address: addr, session: mySession(), items: kept }) + "\n", { mode: 0o600, flag: "wx" });
-      if (insideStore(tmp) && insideStore(file)) renameSync(tmp, file);
-    } catch {}
+      if (insideStore(tmp) && insideStore(file)) {
+        renameSync(tmp, file);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
+  // Ownership is validated at write time, not only at adoption: a file that
+  // belongs to another session (a late id, an old handler outliving its
+  // session, a /new under another instance) is archived whole before this
+  // session's first write to it — never merged or relabeled. An already-
+  // adopted writer facing a MISSING file is stale (another instance reset
+  // this terminal after us): drop the event, never recreate the file.
   function mutate(addr: string, fn: (items: Bookmark[]) => boolean) {
     return serialized(() => {
       const st = readState(addr);
-      if (!fn(st.items)) return;
-      writeState(addr, st.items);
+      if (st.unreadable) return; // skip; a later event retries
+      if (resetPending) {
+        if (!fn([])) return; // does not qualify: the pending reset waits for one that does
+        if (!archiveState(addr)) return; // still blocked: keep waiting
+        resetPending = false;
+        const fresh: Bookmark[] = [];
+        if (!fn(fresh)) return;
+        if (writeState(addr, fresh)) ownWrites++;
+        return;
+      }
+      const foreign = st.corrupt || (st.session !== "" && st.session !== sessionId);
+      if (foreign && !fn([])) return; // the event does not qualify: never archive for it
+      if (st.absent) {
+        if (!justArchivedByUs && ownWrites > 0) return; // we wrote it and it vanished without us archiving: another instance reset this terminal
+      }
+      if (foreign) {
+        if (!archiveState(addr)) return; // archive failed: retry on a later event
+        justArchivedByUs = true;
+      }
+      const items = foreign ? [] : st.items;
+      if (!fn(items)) return;
+      if (writeState(addr, items)) ownWrites++;
     });
   }
 
@@ -197,14 +244,24 @@ export default function (pi: ExtensionAPI) {
       try {
         session = String((JSON.parse(readFileSync(file, "utf8")) as { session?: string }).session ?? "");
       } catch {}
-      const safe = session ? encodeURIComponent(session).slice(0, 80) : "";
+      let safe = "";
+      if (session) {
+        try {
+          safe = encodeURIComponent(session).slice(0, 80);
+        } catch {
+          safe = session.replace(/[^\w.-]/g, "_").slice(0, 80); // lone surrogates throw encode
+        }
+      }
       const name = (safe || "unlabeled") + "-" + Date.now();
       const dir = join(archDirOf(), encodeURIComponent(addr));
       if (!insideStore(dir) || !insideStore(file)) return false; // before any creation
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       if (!insideStore(dir)) return false; // revalidate after creation
-      const dest = join(dir, name + ".json");
+      let dest = join(dir, name + ".json");
+      for (let n = 1; existsSync(dest); n++) dest = join(dir, name + "-" + n + ".json");
+      if (!insideStore(dest)) return false;
       renameSync(file, dest);
+      justArchivedByUs = true;
       const now = new Date();
       try {
         utimesSync(dest, now, now);
@@ -217,10 +274,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Per terminal keep the newest ARCHIVE_KEEP *.json archives no older than
-  // ARCHIVE_DAYS (from archive time); across all terminals stay under
-  // ARCHIVE_TOTAL bytes. Entries we did not write are ignored, never
-  // deleted; a failed unlink retries on the next trim; keepPath (the file
-  // just archived) always survives.
+  // ARCHIVE_DAYS from archive time; across all terminals stay under
+  // ARCHIVE_TOTAL bytes. The just-archived file (keepPath) always survives
+  // and occupies one of the KEEP slots. Only *.json entries are managed;
+  // everything else is ignored. A failed unlink does not stop the sweep:
+  // the bytes stay counted and the next eligible file is still tried.
   function trimArchives(keepPath?: string): void {
     try {
       const cutoff = Date.now() - ARCHIVE_DAYS * 86_400_000;
@@ -238,27 +296,64 @@ export default function (pi: ExtensionAPI) {
           .map((n) => {
             const q = join(sub, n);
             try {
-              return { p: q, m: statSync(q).mtimeMs, s: statSync(q).size };
+              const m = Math.min(statSync(q).mtimeMs, Date.now()); // future stamps clamp
+              return { p: q, m, s: statSync(q).size };
             } catch {
               return null;
             }
           })
           .filter((x): x is { p: string; m: number; s: number } => x !== null)
           .sort((a, b) => b.m - a.m);
+        let slots = 0;
         for (let i = 0; i < files.length; i++) {
           const f = files[i];
           if (f.p === keepPath) {
             live.push(f);
+            slots++; // the fresh archive occupies one of the KEEP slots
             continue;
           }
-          if (i >= ARCHIVE_KEEP || f.m < cutoff) {
+          if (slots >= ARCHIVE_KEEP || f.m < cutoff) {
             try {
               if (insideStore(f.p)) unlinkSync(f.p);
-            } catch {}
+            } catch {
+              live.push(f); // undeletable: still on disk, still counted
+            }
             continue;
           }
           live.push(f);
+          slots++;
         }
+      }
+      // Per-terminal count cap after the fact: the fresh archive always
+      // survives; the oldest non-keep archives go until ARCHIVE_KEEP remain
+      // per terminal directory.
+      const byDir = new Map<string, { p: string; m: number; s: number }[]>();
+      for (const f of live) {
+        const key = dirname(f.p);
+        const arr = byDir.get(key) ?? [];
+        arr.push(f);
+        byDir.set(key, arr);
+      }
+      const evict: string[] = [];
+      for (const arr of byDir.values()) {
+        arr.sort((x, y) => x.m - y.m); // oldest first
+        let extra = arr.filter((x) => x.p !== keepPath).length - 0;
+        let keepCount = arr.length;
+        for (const x of arr) {
+          if (keepCount <= ARCHIVE_KEEP) break;
+          if (x.p === keepPath) continue;
+          evict.push(x.p);
+          keepCount--;
+        }
+      }
+      for (const p of evict) {
+        try {
+          if (insideStore(p)) unlinkSync(p);
+        } catch {}
+      }
+      for (const p of evict) {
+        const i2 = live.findIndex((x) => x.p === p);
+        if (i2 >= 0 && !existsSync(p)) live.splice(i2, 1);
       }
       let total = live.reduce((a, f) => a + f.s, 0);
       if (total > ARCHIVE_TOTAL) {
@@ -268,9 +363,9 @@ export default function (pi: ExtensionAPI) {
           if (f.p === keepPath) continue;
           try {
             if (insideStore(f.p)) unlinkSync(f.p);
-            total -= f.s;
+            total -= f.s; // subtract only after a successful removal
           } catch {
-            break;
+            continue; // try the next eligible archive
           }
         }
       }
@@ -278,27 +373,22 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Once per process, before this session's first state change: make the
-  // store this session's. A file written by another session of this
-  // terminal is archived whole; a file this very session wrote (--session
-  // resume) stays as it is. False when adoption did not complete (no
-  // session id yet, or the archive failed): the caller drops the event and
-  // the next one retries, so an old history is never silently merged.
+  // store this session's. False when adoption did not complete (unreadable
+  // file, or the archive failed): the caller drops the event and the next
+  // one retries, so an old history is never silently merged. No id yet:
+  // record terminal-keyed and do NOT latch — a late id must still adopt.
   async function adopt(addr: string): Promise<boolean> {
     if (sessionAdopted) return true;
     const mine = mySession();
-    // No id from this host: record terminal-keyed, exactly as before session
-    // scoping existed (never block recording on a missing id).
-    if (!mine) {
-      sessionAdopted = true;
-      return true;
-    }
+    if (!mine) return true;
     let ok = true;
     await serialized(() => {
-      let raw: { session?: string } | null = null;
-      try {
-        raw = JSON.parse(readFileSync(fileOf(addr), "utf8")) as { session?: string };
-      } catch {}
-      if (raw && raw.session !== mine) ok = archiveState(addr);
+      const st = readState(addr);
+      if (st.unreadable) {
+        ok = false;
+        return;
+      }
+      if (!st.absent && (st.corrupt || st.session !== mine)) ok = archiveState(addr);
     });
     sessionAdopted = ok;
     return ok;
@@ -384,14 +474,20 @@ export default function (pi: ExtensionAPI) {
       .then((r: { code: number; stdout: string }) => {
         if (r.code !== 0) return;
         const parsed = JSON.parse(r.stdout) as { terminals?: Array<{ address?: string }> };
-        const live = new Set((parsed.terminals ?? []).map((t) => t.address));
+        if (!parsed.terminals?.length) return; // an empty listing is a lie: never sweep on it
+        const live = new Set(parsed.terminals.map((t) => t.address));
         for (const f of readdirSync(stateDirOf()).filter((x: string) => x.endsWith(".json"))) {
           try {
             const sweepPath = join(stateDirOf(), f);
-          if (!insideStore(sweepPath)) return; // outside the store: never touch
+          if (!insideStore(sweepPath)) continue; // outside the store: never touch
           chmodSync(sweepPath, 0o600);
           } catch {}
-          const addr = decodeURIComponent(f.slice(0, -".json".length));
+          let addr: string;
+          try {
+            addr = decodeURIComponent(f.slice(0, -".json".length));
+          } catch {
+            continue;
+          }
           if (!live.has(addr)) archiveState(addr); // a dead terminal's last session is archived, not discarded
         }
       })
@@ -417,18 +513,21 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_info_changed", async (event: { name?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
+      justArchivedByUs = false; // event boundary
       const addr = await resolveAddress();
       if (!addr) return;
-      if (!(await adopt(addr))) return;
       const title = (event.name ?? "").slice(0, 80);
       if (!title) return;
       if (!(await wasTypedRename(addr, event.name ?? ""))) return;
-      await serialized(() => {
-        const st = readState(addr);
-        const last = st.items[st.items.length - 1];
-        if (last && last.title === title) return;
-        st.items.push({ num: 0, title, ts: Date.now() });
-        writeState(addr, st.items);
+      if (!(await adopt(addr))) return;
+      // Through mutate(): unreadable files are never replaced, a file owned
+      // by another session is archived before this session's first write,
+      // and a stale writer never recreates a reset terminal's file.
+      await mutate(addr, (items) => {
+        const last = items[items.length - 1];
+        if (last && last.title === title) return false;
+        items.push({ num: 0, title, ts: Date.now() });
+        return true;
       });
     } catch {}
   });
@@ -436,6 +535,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }, ctx: unknown) => {
     try {
       sessionOf(ctx);
+      justArchivedByUs = false; // event boundary
       if (event.message?.role !== "user") return;
       const text = textOf(event.message);
       if (!text.trim()) return;
@@ -444,7 +544,6 @@ export default function (pi: ExtensionAPI) {
       const prompt = unwrapEnvelope(text).trim().slice(0, PROMPT_MAX);
       const addr = await resolveAddress();
       if (!addr) return;
-      if (!(await adopt(addr))) return;
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (!items[i].promptAnchor) {
@@ -461,6 +560,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event: { messages?: Array<{ role?: string; content?: unknown }> }, ctx: unknown) => {
     try {
       sessionOf(ctx);
+      justArchivedByUs = false; // event boundary
       // event.messages holds the whole run; the last assistant text in it is
       // the final report, whatever tool-call sub-turns ran before it. Writing
       // on every agent_end (retries included) leaves the last run's answer on
@@ -478,7 +578,6 @@ export default function (pi: ExtensionAPI) {
       const report = text.length > REPORT_MAX ? text.slice(-REPORT_MAX) : text;
       const addr = await resolveAddress();
       if (!addr) return;
-      if (!(await adopt(addr))) return;
       await mutate(addr, (items) => {
         for (let i = items.length - 1; i >= 0; i--) {
           if (items[i].promptAnchor) {
@@ -495,6 +594,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event: { reason?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
+      justArchivedByUs = false; // event boundary
       if (event.reason !== "new") return;
       const addr = await resolveAddress();
       if (!addr) return;
@@ -504,6 +604,7 @@ export default function (pi: ExtensionAPI) {
         // archive it (a mid-session /new resets through the id change).
         if (sessionAdopted) return;
         sessionAdopted = archiveState(addr);
+        resetPending = !sessionAdopted; // blocked: retry the reset on the next event
       });
     } catch {}
   });

@@ -98,12 +98,12 @@ session's** history:
 Numbers are reassigned densely 1..N (oldest first) on every write. A
 different session starting in the terminal moves the file whole into
 `data/rename-history/archive/<address>/<encoded session>-<time>.json` (a
-file with no session id archives as `unlabeled-<time>.json`), so
-re-archiving a session never overwrites its earlier snapshot. Archives keep
-the **newest 10 sessions per terminal for 30 days from archive time**,
-within a **20 MB** total cap; entries the extension did not write are
-ignored. The store holds report text, so it is created with the folder at
-mode 700 and the files at 600.
+file with no session id archives as `unlabeled-<time>.json`); a same-
+millisecond re-archive gets a numeric suffix, so no snapshot is ever
+overwritten. Archives keep the **newest 10 sessions per terminal for 30
+days from archive time**, within a **20 MB** total cap; only `*.json`
+entries are managed. The store holds report text, so it is created with
+the folder at mode 700 and the files at 600.
 
 Tools built on the state files (voice assistants, agents) read the terminal
 file for the current session and can list `archive/<address>/` and read a
