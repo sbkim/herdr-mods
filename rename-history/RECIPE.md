@@ -44,9 +44,13 @@ address>.json` ({v, address, items}), `watch(cx, addr)` re-reads on folder
 changes, `jump()` does the anchor search and `terminal.scroll`;
 `mod.json` { "place": "none", "overlay": { "width": 300, "height": 0.8 } }.
 (b) the omo extension `omo-extension/index.ts`: on
-`session_info_changed` — only for a rename the person typed, checked by one
-`hc read` of the tail for the "Session name set" line — push {title (max 80
-chars), ts}; on user `message_end` attach up to 3 prompt anchor lines
+`session_info_changed` — only when the raw name's last character is a hidden
+marker (U+200B/U+200C/U+200D/U+2060; the sender's opt-in, see the README's
+"The hidden marker"; U+FEFF is omo-removed and not a marker) — strip the
+trailing marker run, trim, and push {title (max 80 chars), ts}; mid-string
+zero-width characters are emoji components (👩‍💻) and stay; an unmarked
+name, a typed rename or an omo auto-title alike, is not recorded; on user
+`message_end` attach up to 3 prompt anchor lines
 (prefix 60 chars) plus the full prompt text (1,000 chars); on `agent_end`
 attach report anchors and the final report — the last assistant text of the
 run, 4,000 chars keeping the tail (conclusion side) — skipping rename
@@ -79,8 +83,11 @@ an older copy); `mod.json`'s overlay height 0.8 (a share of the window)
 keeps the 12-row history plus the base items on screen; the popup is
 content-sized, so cap the shown rows (MAX_SHOWN 12) or the base items fall
 off; anchors are line prefixes, not row numbers, because the scrollback
-reflows; a title event costs one `hc read` (8 lines) to prove it was typed,
-so agent-set titles are dropped; the report is the last assistant text only;
+reflows; a title is recorded only when it ends with a hidden marker
+(bori's send_message appends U+200B to /rename first lines automatically,
+agents send the printf form documented in the README; a bare agent `hc send`
+arrives enveloped and turns into a self-rename chat message for the
+target); the report is the last assistant text only;
 remote addresses contain "/" and are percent-encoded into file names; the
 extension must never write to the session screen — every handler is guarded
 and silent. Assumes Herdr 0.1.x with terminal_menu layouts support and omo
@@ -89,8 +96,9 @@ and silent. Assumes Herdr 0.1.x with terminal_menu layouts support and omo
 **Done when:** `herdr-app check` on the mod folder passes; with
 `"terminal_menu": "rename-history"` in a personal layout and Herdr
 restarted, a right-click shows the usual items plus RENAME HISTORY once the
-extension has recorded a title, each row labelled "N. title"; a title omo or
-the agent set on its own never appears; resuming with `--session` keeps the
+extension has recorded a title, each row labelled "N. title"; a title
+without the trailing hidden marker (typed by hand or set by omo itself)
+never appears; resuming with `--session` keeps the
 history while a fresh omo or `/new` in that terminal archives the file and
 restarts at 1; an A→B→A cycle leaves every earlier snapshot intact
 (timestamped archive names), the /new race cannot archive the current

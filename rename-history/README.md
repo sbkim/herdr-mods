@@ -20,9 +20,9 @@ with the omo agent's terminals (see Limits).
 - Jumping locates the title by text anchors in the scrollback (one `hc read`
   at jump time), so it survives reflow. When the position is gone, a dialog
   shows the terminal's tail instead.
-- Only a `/rename` the person actually typed is recorded (the extension
-  checks the terminal's tail for the "Session name set" line; titles omo or
-  an agent set on their own are filtered out).
+- Only a `/rename` carrying the **hidden marker** is recorded; the person's
+  own typed renames and omo's auto-titles carry no marker and are skipped
+  (see [The hidden marker](#the-hidden-marker)).
 - **Session-scoped**: the file carries the writing session's id (read from
   the handler context the host provides). Resuming the same session
   (`omo --session …` after `/exit`) keeps its history; any other session
@@ -114,8 +114,8 @@ file by session id for past sessions.
 - The history is recorded by an **omo extension** — terminals running other
   agents or plain shells get the plain menu without the section. Forked or
   worker omo sessions share a terminal and do not record.
-- Only **typed** `/rename`s are recorded; detecting one costs a short
-  `hc read` of the terminal's tail per title event.
+- Only **marked** `/rename`s are recorded; the check reads the event payload
+  itself and costs nothing on the terminal.
 - The final report is the **last assistant text of the latest run** —
   intermediate tool-call turns are not kept, and very short rename
   confirmations are skipped.
@@ -144,12 +144,73 @@ file by session id for past sessions.
   `archive/<terminal address>/` — and they require a tampered store or two
   live writers on one terminal.
 
+## The hidden marker
+
+A rename is recorded only when its raw title **ends** with a zero-width
+character: U+200B (zero-width space), U+200C, U+200D or U+2060. Senders
+append U+200B as the last character of the `/rename` title; the extension
+sees the marker in the event payload itself, so the screen-read race that
+dropped renames is gone. Before storing, the trailing marker run is
+stripped, the title is trimmed and sliced to 80 characters, and what lands
+in the file and the menu is the clean text.
+
+- Mid-string zero-width characters are **kept**: they are emoji components
+  (👩‍💻 is U+1F469 U+200D U+1F4BB), and stripping them would corrupt
+  titles. Only a trailing run of markers is removed.
+- U+FEFF is **not** a marker. omo strips it from the name itself (measured),
+  so it never reaches the gate.
+- A rename the person typed by hand and omo's auto-titles carry no marker
+  and are not recorded (owner decision, 2026-11-20: the history tracks the
+  delegated workflow).
+
+### Sending a recorded rename
+
+**Through bori** (herdr-core-mcp): its `send_message` appends the marker to
+any `/rename` first line automatically. Senders do nothing.
+
+**From an omo agent via `hc`**: use the shell-portable printf form, since
+`$'\u200b'` does not work in macOS's default bash 3.2:
+
+```sh
+hc exec -- hc send <address> "/rename <title>$(printf '\342\200\213')"
+```
+
+Do **not** send a bare `hc send` from an agent context. It arrives enveloped
+(`<hc from=...>`) and instead of renaming via the TUI it becomes a chat
+message that makes the target agent rename itself: that costs the target a
+model turn and leaves no confirmation line.
+
+### Pairing
+
+The prompt of each turn pairs with the most recent recorded rename. Retries
+(a turn ending more than once with no new prompt in between) update that
+same item. A turn whose prompt found no un-prompted item, for example
+because the rename itself was missed, never overwrites an older item: its
+report is simply not recorded.
+
+### Accepted residuals
+
+- The t39 terminal's item 1 keeps its contaminated report (owner decision,
+  2026-11-20: no repair).
+- The marker remains visible in the terminal's OSC title and in omo's
+  session jsonl. Removing it there would need omo or herdr core changes and
+  is out of scope.
+- Retry-turn event order is verified by harness assumption only; live
+  checks cover normal turns.
+- A steering message mid-turn nulls the pairing, so that turn's final
+  report is intentionally not recorded (the conservative rule).
+- bori's `send_message` appends the marker for all target terminals, agents
+  or shells alike. On shells it is harmless: the same "/rename: command not
+  found" as today.
+- An omo session that was already running before the marker-gated extension
+  was deployed keeps the old screen-read gate and does not record bori's
+  markered renames until omo restarts.
+
 ## Privacy & reach
 
 The extension writes one JSON file per omo terminal under Herdr's `data/`
 folder (folder 700, files 600 — reports can carry secrets) and runs `hc ls` /
-`hc get` to find which terminal it is in, plus one short `hc read` per title
-event.
+`hc get` to find which terminal it is in.
 The mod reads those files (`readTextFile`), runs `git` for the menu's
 worktree items (as the shipped menu does) and one `hc read` on jump. Nothing
 leaves the machine.
