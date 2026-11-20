@@ -15,8 +15,10 @@ or resumes — writes one marker file per terminal:
 ```
 
 ```json
-{ "v": 1, "address": "…", "since": "2026-11-20T12:00:00.000Z", "state": "waiting_human", "pid": 12345 }
+{ "v": 1, "address": "…", "since": 1763640000000, "state": "waiting_human", "pid": 12345 }
 ```
+
+`since` is epoch milliseconds, the format the mod's stall parser accepts.
 
 written atomically (temp file + rename, dir 0700, file 0600), and removes
 it when the session resumes. The done-blink mod watches `data/` and lights

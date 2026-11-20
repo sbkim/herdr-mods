@@ -98,7 +98,7 @@ console.log("done-blink-stall harness — scratch home:", home);
   check("1.2 v=1", j.v === 1);
   check("1.3 address=t9 canonical", j.address === "t9");
   check("1.4 state=waiting_human", j.state === "waiting_human");
-  check("1.5 since is ISO", !Number.isNaN(Date.parse(j.since)), String(j.since));
+  check("1.5 since is epoch ms", typeof j.since === "number" && Number.isFinite(j.since) && Math.abs(j.since - Date.now()) < 60000, String(j.since));
   check("1.6 pid recorded", j.pid === process.pid, String(j.pid));
   check("1.7 file mode 0600", (statSync(file).mode & 0o777) === 0o600, (statSync(file).mode & 0o777).toString(8));
   check("1.8 dir mode 0700", (statSync(stallDir).mode & 0o777) === 0o700, (statSync(stallDir).mode & 0o777).toString(8));
@@ -166,11 +166,11 @@ console.log("done-blink-stall harness — scratch home:", home);
   console.log("case 7: restart reconciliation");
   const stale = markerOf("t9");
   mkdirSync(stallDir, { recursive: true, mode: 0o700 });
-  writeFileSync(stale, JSON.stringify({ v: 1, address: "t9", since: "2000-01-01T00:00:00.000Z", state: "waiting_human", pid: process.pid }) + "\n", { mode: 0o600 });
+  writeFileSync(stale, JSON.stringify({ v: 1, address: "t9", since: 946684800000, state: "waiting_human", pid: process.pid }) + "\n", { mode: 0o600 });
   const handlers = makePi();
   await emit(handlers, "session_start", { reason: "startup" }, snapCtx([UNATTENDED]));
   const j = JSON.parse(readFileSync(stale, "utf8"));
-  check("7.1 baseline rewrites marker (since refreshed)", Date.parse(j.since) > Date.parse("2000-01-01T00:00:00.000Z"), String(j.since));
+  check("7.1 baseline rewrites marker (since refreshed)", typeof j.since === "number" && j.since > 946684800000, String(j.since));
   await emit(handlers, "session_hold_changed", { change: "resumed", pauseSeq: 2, holds: [] }, snapCtx([]));
 }
 
@@ -184,8 +184,8 @@ console.log("done-blink-stall harness — scratch home:", home);
   const malformed = markerOf("t6");
   const noshape = markerOf("t5");
   const fixtures: [string, string][] = [
-    [deadFile, JSON.stringify({ v: 1, address: "t8", since: "2000-01-01T00:00:00.000Z", state: "waiting_human", pid: exited.pid })],
-    [liveFile, JSON.stringify({ v: 1, address: "t7", since: "2000-01-01T00:00:00.000Z", state: "waiting_human", pid: live.pid! })],
+    [deadFile, JSON.stringify({ v: 1, address: "t8", since: 946684800000, state: "waiting_human", pid: exited.pid })],
+    [liveFile, JSON.stringify({ v: 1, address: "t7", since: 946684800000, state: "waiting_human", pid: live.pid! })],
     [malformed, "{not json"],
     [noshape, JSON.stringify({ v: 1, address: "t5" })],
   ];
@@ -238,6 +238,22 @@ console.log("done-blink-stall harness — scratch home:", home);
     console.log("    threw:", e);
   }
   check("11.1 malformed payloads never throw", !threw);
+}
+
+// 12. cross-compatibility: the written marker must pass the CONSUMER's
+// acceptance rule. Kept in sync with blink.js stall parser
+// (~/.config/herdr-app/mods/done-blink/blink.js: `typeof j.since !==
+// "number" || !Number.isFinite(j.since)` -> the marker is skipped). This
+// is the case that would have caught the since-type mismatch.
+{
+  console.log("case 12: consumer acceptance rule");
+  const handlers = makePi();
+  await emit(handlers, "session_hold_changed", { change: "paused", pauseSeq: 1, holds: [UNATTENDED] }, snapCtx([UNATTENDED]));
+  const j = JSON.parse(readFileSync(markerOf("t9"), "utf8"));
+  // exact guard copied from blink.js (mod stall parser):
+  const accepted = !(typeof j.since !== "number" || !Number.isFinite(j.since));
+  check("12.1 written marker passes the mod's stall parser guard", accepted, String(j.since));
+  await emit(handlers, "session_hold_changed", { change: "resumed", pauseSeq: 2, holds: [] }, snapCtx([]));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -169,6 +169,8 @@ export default function (pi: ExtensionAPI) {
   // session. `pid` names the writing omo so a later load can sweep markers
   // whose writer exited while stalled (that session's resumed event never
   // comes); the mod reads only v/address/since/state and ignores the rest.
+  // `since` is epoch ms — the mod's stall parser accepts only a finite
+  // number (kept in sync with blink.js: typeof since === "number").
   function writeMarker(addr: string): boolean {
     try {
       const file = fileOf(addr);
@@ -177,7 +179,7 @@ export default function (pi: ExtensionAPI) {
       if (!storePathIsHonest() || !insideStore(stallDirOf())) return false; // revalidate after creation
       const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
       if (existsSync(tmp) || !insideStore(tmp)) return false; // fresh exclusive path only
-      writeFileSync(tmp, JSON.stringify({ v: 1, address: addr, since: new Date().toISOString(), state: "waiting_human", pid: process.pid }) + "\n", { mode: 0o600, flag: "wx" });
+      writeFileSync(tmp, JSON.stringify({ v: 1, address: addr, since: Date.now(), state: "waiting_human", pid: process.pid }) + "\n", { mode: 0o600, flag: "wx" });
       if (insideStore(tmp) && insideStore(file)) {
         renameSync(tmp, file);
         return true;
