@@ -12,9 +12,14 @@
 //
 // What is recorded, and why from these events (omo 5.1.78, measured):
 // - Built-in slash commands never fire the `input` event. /rename is recorded
-//   from session_info_changed (payload {type, name}; it carries no cause, so a
-//   title an agent or omo itself set is indistinguishable and is recorded
-//   too — a known limit).
+//   from session_info_changed (payload {type, name}) only when the raw name
+//   ends with a hidden marker character (MARKERS below): the sender — an
+//   agent acting for the person — attaches one to opt the rename into
+//   history, and the trailing marker run is stripped before storing.
+//   Mid-string zero-width characters are emoji components (👩‍💻 =
+//   U+1F469 U+200D U+1F4BB) and never trigger recording. Unmarked names — a
+//   rename the person typed by hand and omo's auto-titles alike — are not
+//   recorded.
 // - /new is session_start with reason "new"; it resets the screen, so the
 //   terminal's file is deleted outright.
 // - message_end (role "user") and turn_end carry the message text; short line
@@ -54,6 +59,12 @@ const ARCHIVE_KEEP = 10;
 const ARCHIVE_DAYS = 30;
 const ARCHIVE_TOTAL = 20 * 1024 * 1024;
 const REPORT_MAX = 4_000;
+// Hidden rename markers, end-attachment convention: a raw session name whose
+// last character is one of these is an opt-in rename that the store records,
+// stripping the trailing marker run before storing. Mid-string occurrences
+// are emoji components and are left untouched. U+FEFF is omo-removed
+// (measured) and deliberately is not a marker.
+const MARKERS = ["\u200b", "\u200c", "\u200d", "\u2060"];
 
 // The store root is resolved at RUN time, never at import time: a host that
 // repoints HOME after loading this module must not send writes to the old
@@ -510,30 +521,27 @@ export default function (pi: ExtensionAPI) {
       .catch(() => {});
   }
 
-  // A typed /rename leaves "Session name set: <name>" on the terminal; a title
-  // omo or an agent set does not. One tail read per title event keeps only
-  // what the person actually typed.
-  async function wasTypedRename(addr: string, name: string): Promise<boolean> {
-    try {
-      const r = await pi.exec("hc", ["read", addr, "--lines", "8"], { timeout: 5000 });
-      if (r.code !== 0) return false;
-      // The marker sits a few lines above the bottom bar (input line, status);
-      // scan the last committed lines, not just the tail.
-      const tail = r.stdout.split("\n").filter((l: string) => l.trim()).slice(-12);
-      return tail.some((l: string) => l.includes("Session name set:") && l.includes(name));
-    } catch {
-      return false;
-    }
-  }
-
+  // Marker gate instead of reading the screen: the signal travels in the
+  // event payload itself, so there is no event-commit race to drop a rename
+  // and no hc read on this path. Only a raw name whose LAST character is a
+  // marker counts (end-attachment convention); a mid-string zero-width
+  // character is an emoji component (👩‍💻 = U+1F469 U+200D U+1F4BB) and never
+  // triggers. Unmarked names — a rename the person typed by hand, and omo's
+  // auto-titles alike — are not recorded.
   pi.on("session_info_changed", async (event: { name?: string }, ctx: unknown) => {
     try {
       sessionOf(ctx);
       const addr = await resolveAddress();
       if (!addr) return;
-      const title = (event.name ?? "").slice(0, 80);
+      const raw = event.name ?? "";
+      const lastCh = raw.charAt(raw.length - 1);
+      if (!lastCh || !MARKERS.includes(lastCh)) return;
+      // Strip the trailing RUN of markers only — never mid-string — then trim;
+      // a marker-only name empties out and records nothing.
+      let end = raw.length;
+      while (end > 0 && MARKERS.includes(raw.charAt(end - 1))) end--;
+      const title = raw.slice(0, end).trim().slice(0, 80);
       if (!title) return;
-      if (!(await wasTypedRename(addr, event.name ?? ""))) return;
       if (!(await adopt(addr))) return;
       // Through mutate(): unreadable files are never replaced, a file owned
       // by another session is archived before this session's first write,
